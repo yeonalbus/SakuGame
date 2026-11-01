@@ -19,6 +19,9 @@ src-tauri/target/
 target/
 **/*.rs.bk
 
+# ---- 打包产物（build-release.bat 输出）----
+release/
+
 # ---- 日志与临时文件 ----
 *.log
 *.tmp

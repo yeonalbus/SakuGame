@@ -128,6 +128,16 @@ pnpm exec vue-tsc --noEmit
 
 ## 9. 构建产物同步 + 打包冒烟
 
+**本地一键打包（推荐日常测试）**——双击项目根目录的 `build-release.bat`，或命令行：
+
+```bat
+build-release.bat             :: 构建绿色版 exe -> release\SakuGame.exe
+build-release.bat --run       :: 构建完直接启动
+build-release.bat --bundle    :: 额外生成安装包（msi + nsis）
+```
+
+手动全量构建（发版正式产物，含安装包）：
+
 ```bash
 pnpm tauri build
 ```
