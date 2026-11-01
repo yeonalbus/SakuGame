@@ -794,4 +794,19 @@ mod tests {
         assert!(!resumed.cancelled);
         let _ = fs::remove_dir_all(&root);
     }
+
+    /// T30：中文目录名 + 中文 exe 名（ACC-02-34）
+    #[test]
+    fn t30_chinese_names() {
+        let root = tmp_root("t30");
+        let dir = root.join("巫女神さまIF");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("巫女神さま.exe"), b"x").unwrap();
+
+        let games = scan(&root);
+        assert_eq!(games.len(), 1, "中文目录必须能建档");
+        assert_eq!(games[0].display_name, "巫女神さまIF");
+        assert_eq!(games[0].game_type, GameType::Folder);
+        let _ = fs::remove_dir_all(&root);
+    }
 }

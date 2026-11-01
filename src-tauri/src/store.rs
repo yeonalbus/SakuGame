@@ -341,6 +341,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// ACC-04-03 / ACC-04-04：扫描器不得自动填游戏编号与封面（即使目录名是编号）
+    #[test]
+    fn scan_never_fills_game_code_or_cover() {
+        let (db, dir) = temp_db("code");
+        let repo = seed_repo(&db);
+
+        apply_results(&db, repo, &[folder_entry("RJ01005841", 10)], true).unwrap();
+
+        let (code, cover): (Option<String>, Option<String>) = db
+            .with(|c| {
+                Ok(c.query_row(
+                    "SELECT game_code, cover_path FROM games",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .unwrap();
+
+        assert!(code.is_none(), "游戏编号必须为空（禁止自动扫描）");
+        assert!(cover.is_none(), "封面必须为空（禁止自动扫描）");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// ACC-CON-01 / ACC-CON-02：schema 不得含 exe 字段、exe 表或版本字段（D19 / D20 护栏）
     #[test]
     fn schema_excludes_exe_and_version_fields() {
