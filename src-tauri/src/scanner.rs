@@ -809,4 +809,30 @@ mod tests {
         assert_eq!(games[0].game_type, GameType::Folder);
         let _ = fs::remove_dir_all(&root);
     }
+
+    /// T31：超长路径（>260 字符）仍能扫描（ACC-02-35）
+    /// 构造方式：3 层、每层 80 个汉字（约 240 字节），总长显著超过 MAX_PATH。
+    #[test]
+    fn t31_long_path() {
+        let root = tmp_root("t31");
+        let segment = "长".repeat(80); // 每层约 80 字符
+        let mut deep = root.clone();
+        for _ in 0..3 {
+            deep = deep.join(&segment);
+        }
+
+        // 创建时必须用 \\?\ 前缀，否则 std 会因 MAX_PATH 失败
+        let deep_ext = extend_path(&deep);
+        if fs::create_dir_all(&deep_ext).is_err() {
+            eprintln!("跳过：当前环境无法创建超长路径");
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        fs::write(deep_ext.join("game.exe"), b"x").unwrap();
+
+        let games = scan(&root);
+        assert_eq!(games.len(), 1, "超长路径下的游戏应被扫到");
+        assert_eq!(games[0].display_name, segment);
+        let _ = fs::remove_dir_all(&root);
+    }
 }
