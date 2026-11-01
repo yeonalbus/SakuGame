@@ -72,4 +72,23 @@ mod tests {
         let got = resolve(&locators).expect("应命中盘符项");
         assert_eq!(got.0, LocatorKind::Drive);
     }
+
+    /// ACC-01-07：盘符不可达时必须跳过，继续尝试 IP（按可达性而非存在性）
+    #[test]
+    fn resolve_skips_unreachable_drive() {
+        let locators = vec![
+            RepositoryLocator {
+                kind: "drive".into(),
+                path_template: "Q:\\definitely-not-exists".into(),
+                last_ok_at: None,
+            },
+            RepositoryLocator {
+                kind: "ip".into(),
+                path_template: std::env::temp_dir().to_string_lossy().to_string(),
+                last_ok_at: None,
+            },
+        ];
+        let got = resolve(&locators).expect("盘符不可达时应回退到 IP");
+        assert_eq!(got.0, LocatorKind::Ip);
+    }
 }

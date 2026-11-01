@@ -1,11 +1,12 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-mod commands;
-mod db;
-mod error;
-mod locator;
-mod models;
-mod scanner;
-mod state;
+pub mod commands;
+pub mod db;
+pub mod error;
+pub mod locator;
+pub mod models;
+pub mod scanner;
+pub mod state;
+pub mod store;
 
 use tauri::Manager;
 

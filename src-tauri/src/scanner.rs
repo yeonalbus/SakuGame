@@ -754,4 +754,44 @@ mod tests {
         assert_eq!(games[0].game_type, GameType::Archive);
         let _ = fs::remove_dir_all(&root);
     }
+
+    /// T17：取消后立即停止，不产出档案（D10）
+    #[test]
+    fn t17_cancel_stops_scan() {
+        let root = tmp_root("t17");
+        for i in 0..5 {
+            let d = root.join(format!("g{i}"));
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("game.exe"), b"x").unwrap();
+        }
+        let cfg = ScanConfig::default();
+        let ctl = ScanControl::new();
+        ctl.cancel();
+
+        let r = scan_repository(&root, &cfg, &ctl, 0, |_| {});
+        assert!(r.cancelled, "取消后应返回 cancelled");
+        assert!(r.games.is_empty(), "取消不应产出档案");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// T16：断点续扫只处理剩余顶层条目（D10）
+    #[test]
+    fn t16_resume_from_checkpoint() {
+        let root = tmp_root("t16");
+        for i in 0..3 {
+            let d = root.join(format!("g{i}"));
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("game.exe"), b"x").unwrap();
+        }
+        let cfg = ScanConfig::default();
+        let ctl = ScanControl::new();
+
+        let full = scan_repository(&root, &cfg, &ctl, 0, |_| {});
+        assert_eq!(full.games.len(), 3);
+
+        let resumed = scan_repository(&root, &cfg, &ctl, 2, |_| {});
+        assert_eq!(resumed.games.len(), 1, "从索引 2 续扫应只处理剩余 1 个");
+        assert!(!resumed.cancelled);
+        let _ = fs::remove_dir_all(&root);
+    }
 }

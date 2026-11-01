@@ -1,7 +1,6 @@
 //! Tauri 命令层：仓库配置、档案读写、扫描控制。
 //! 依据：DSPlans/MVPv1扫描器规格.md §7（IPC 协议）、§8（幂等重扫）、§10（错误处理）
 
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -13,11 +12,12 @@ use crate::db::Db;
 use crate::error::{AppError, AppResult};
 use crate::locator;
 use crate::models::{
-    GameDetail, GameEntry, GameRow, GameType, LocatorKind, NewRepository, RepositoryLocator,
-    RepositoryRow, ScanPhase, ScanProgress, ScanSummary,
+    GameDetail, GameRow, LocatorKind, NewRepository, RepositoryLocator, RepositoryRow, ScanPhase,
+    ScanProgress, ScanSummary,
 };
 use crate::scanner::{self, ScanConfig, ScanControl};
 use crate::state::{ActiveScan, AppState, ScanSlot};
+use crate::store;
 
 // ---------------------------------------------------------------------------
 // 仓库
@@ -524,7 +524,7 @@ fn run_scan(
             serde_json::json!({ "job_id": job_id, "message": "扫描已取消" }),
         );
     } else {
-        match apply_results(&db, repository_id, &result.games, start_index == 0) {
+        match store::apply_results(&db, repository_id, &result.games, start_index == 0) {
             Ok((added, updated, missing)) => {
                 let _ = db.with(|conn| {
                     conn.execute(
@@ -586,115 +586,6 @@ fn run_scan(
             guard.active = None;
         }
     }
-}
-
-/// 幂等重扫（§8）：新增 / 更新（保留用户字段）/ 标记缺失
-fn apply_results(
-    db: &Db,
-    repository_id: i64,
-    games: &[GameEntry],
-    mark_missing: bool,
-) -> AppResult<(u32, u32, u32)> {
-    db.with_mut(|conn| {
-        let tx = conn.transaction()?;
-        let now = Db::now();
-        let mut added = 0u32;
-        let mut updated = 0u32;
-        let mut seen: HashSet<(String, String)> = HashSet::new();
-
-        for g in games {
-            seen.insert((g.relative_path.clone(), g.group_key.clone()));
-
-            let existing: Option<i64> = tx
-                .query_row(
-                    "SELECT id FROM games WHERE repository_id=?1 AND relative_path=?2 AND group_key=?3",
-                    params![repository_id, g.relative_path, g.group_key],
-                    |r| r.get(0),
-                )
-                .optional()?;
-
-            match existing {
-                Some(id) => {
-                    // 只刷新大小与类型；绝不触碰 display_name / game_code / cover_path（§8）
-                    tx.execute(
-                        "UPDATE games SET size_bytes=?1, game_type=?2, status='ok', updated_at=?3 WHERE id=?4",
-                        params![g.size_bytes as i64, g.game_type.as_str(), now, id],
-                    )?;
-                    write_game_files(&tx, id, g)?;
-                    updated += 1;
-                }
-                None => {
-                    tx.execute(
-                        "INSERT INTO games(repository_id, relative_path, group_key, game_type,
-                                           display_name, size_bytes, status, created_at, updated_at)
-                         VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'ok', ?7, ?7)",
-                        params![
-                            repository_id,
-                            g.relative_path,
-                            g.group_key,
-                            g.game_type.as_str(),
-                            g.display_name,
-                            g.size_bytes as i64,
-                            now
-                        ],
-                    )?;
-                    let id = tx.last_insert_rowid();
-                    write_game_files(&tx, id, g)?;
-                    added += 1;
-                }
-            }
-        }
-
-        let mut missing = 0u32;
-        if mark_missing {
-            let mut stmt = tx.prepare(
-                "SELECT id, relative_path, group_key FROM games
-                 WHERE repository_id=?1 AND status='ok'",
-            )?;
-            let rows: Vec<(i64, String, String)> = stmt
-                .query_map(params![repository_id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
-            drop(stmt);
-            for (id, rp, gk) in rows {
-                if !seen.contains(&(rp, gk)) {
-                    tx.execute(
-                        "UPDATE games SET status='missing', updated_at=?1 WHERE id=?2",
-                        params![now, id],
-                    )?;
-                    missing += 1;
-                }
-            }
-        }
-
-        tx.commit()?;
-        Ok((added, updated, missing))
-    })
-}
-
-fn write_game_files(tx: &rusqlite::Transaction<'_>, game_id: i64, g: &GameEntry) -> AppResult<()> {
-    if g.game_type != GameType::Archive {
-        return Ok(());
-    }
-    tx.execute("DELETE FROM game_files WHERE game_id=?1", params![game_id])?;
-    for grp in &g.groups {
-        for f in &grp.files {
-            tx.execute(
-                "INSERT OR REPLACE INTO game_files(game_id, group_key, file_name, part_index, size_bytes)
-                 VALUES(?1, ?2, ?3, ?4, ?5)",
-                params![
-                    game_id,
-                    grp.base_name,
-                    f.file_name,
-                    f.part_index,
-                    f.size_bytes as i64
-                ],
-            )?;
-        }
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
