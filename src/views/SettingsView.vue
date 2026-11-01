@@ -1,0 +1,282 @@
+<script setup lang="ts">
+import { ref, reactive, computed, onMounted, onUnmounted } from "vue";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
+import { api, errorText, onScanFailed, onScanFinished, onScanProgress } from "../api";
+import type { NewRepository, RepositoryRow, ScanProgress } from "../types";
+
+const emit = defineEmits<{ toast: [text: string, error?: boolean] }>();
+
+const tab = ref<"repos" | "about">("repos");
+const repos = ref<RepositoryRow[]>([]);
+const progress = ref<ScanProgress | null>(null);
+const version = ref("");
+const showForm = ref(false);
+const busy = ref(false);
+
+const form = reactive({ drive: "", ip: "", host: "" });
+const unlisteners: UnlistenFn[] = [];
+
+const scanning = computed(
+  () => progress.value?.phase === "scanning" || progress.value?.phase === "paused",
+);
+const paused = computed(() => progress.value?.phase === "paused");
+const pct = computed(() => {
+  const p = progress.value;
+  if (!p || !p.total) return 0;
+  return Math.min(100, Math.round((p.done / p.total) * 100));
+});
+
+async function loadRepos() {
+  try {
+    repos.value = await api.listRepositories();
+  } catch (e) {
+    emit("toast", errorText(e), true);
+  }
+}
+
+async function refreshProgress() {
+  try {
+    progress.value = await api.scanStatus();
+  } catch {
+    /* 忽略 */
+  }
+}
+
+async function scan(repo: RepositoryRow) {
+  try {
+    busy.value = true;
+    await api.startScan(repo.id);
+    await refreshProgress();
+  } catch (e) {
+    emit("toast", errorText(e), true);
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function pause() {
+  try {
+    await api.pauseScan();
+    await refreshProgress();
+  } catch (e) {
+    emit("toast", errorText(e), true);
+  }
+}
+
+async function resume() {
+  try {
+    await api.resumeScan();
+    await refreshProgress();
+  } catch (e) {
+    emit("toast", errorText(e), true);
+  }
+}
+
+async function cancel() {
+  try {
+    await api.cancelScan();
+    progress.value = null;
+  } catch (e) {
+    emit("toast", errorText(e), true);
+  }
+}
+
+function lastSegment(path: string): string {
+  const trimmed = path.replace(/[\\/]+$/, "");
+  const idx = Math.max(trimmed.lastIndexOf("\\"), trimmed.lastIndexOf("/"));
+  return idx >= 0 ? trimmed.slice(idx + 1) : trimmed;
+}
+
+async function addRepo() {
+  const drive = form.drive.trim();
+  if (!drive) {
+    emit("toast", "盘符路径为必填项", true);
+    return;
+  }
+  const locators: NewRepository["locators"] = [{ kind: "drive", path_template: drive }];
+  if (form.ip.trim()) locators.push({ kind: "ip", path_template: form.ip.trim() });
+  if (form.host.trim()) locators.push({ kind: "host", path_template: form.host.trim() });
+
+  const payload: NewRepository = {
+    relative_root: lastSegment(drive),
+    locators,
+  };
+  try {
+    await api.addRepository(payload);
+    form.drive = "";
+    form.ip = "";
+    form.host = "";
+    showForm.value = false;
+    await loadRepos();
+    emit("toast", "仓库已添加");
+  } catch (e) {
+    emit("toast", errorText(e), true);
+  }
+}
+
+async function removeRepo(repo: RepositoryRow) {
+  if (!window.confirm(`删除仓库「${repo.name}」？该仓库下所有档案将被一并删除。`)) return;
+  try {
+    await api.deleteRepository(repo.id);
+    await loadRepos();
+    emit("toast", "仓库已删除");
+  } catch (e) {
+    emit("toast", errorText(e), true);
+  }
+}
+
+async function checkRepo(repo: RepositoryRow) {
+  try {
+    const updated = await api.checkRepository(repo.id);
+    await loadRepos();
+    emit(
+      "toast",
+      updated.is_offline
+        ? "仓库不可达，请检查网络配置"
+        : `可达：${updated.resolved_path ?? updated.name}`,
+      updated.is_offline,
+    );
+  } catch (e) {
+    emit("toast", errorText(e), true);
+  }
+}
+
+function fmtTime(v: string | null): string {
+  if (!v) return "—";
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return v;
+  return d.toLocaleString();
+}
+
+onMounted(async () => {
+  await loadRepos();
+  await refreshProgress();
+  version.value = await getVersion().catch(() => "0.1.0");
+  unlisteners.push(
+    await onScanProgress((p) => {
+      progress.value = p;
+    }),
+  );
+  unlisteners.push(
+    await onScanFinished((s) => {
+      progress.value = null;
+      void loadRepos();
+      emit(
+        "toast",
+        `扫描完成：新增 ${s.added}，更新 ${s.updated}，缺失 ${s.missing}，警告 ${s.warning_count}`,
+        false,
+      );
+    }),
+  );
+  unlisteners.push(
+    await onScanFailed((p) => {
+      progress.value = null;
+      emit("toast", p.message, true);
+    }),
+  );
+});
+
+onUnmounted(() => {
+  unlisteners.forEach((fn) => fn());
+});
+</script>
+
+<template>
+  <div class="settings-layout">
+    <nav class="sub-nav">
+      <button class="nav-item" :class="{ active: tab === 'repos' }" @click="tab = 'repos'">
+        仓库管理
+      </button>
+      <button class="nav-item" :class="{ active: tab === 'about' }" @click="tab = 'about'">
+        关于
+      </button>
+    </nav>
+
+    <div v-if="tab === 'repos'">
+      <!-- 上栏：进度区 -->
+      <div class="progress-area">
+        <div v-if="progress">
+          <div class="progress-row">
+            <span>{{ progress.done }} / {{ progress.total }}</span>
+            <span class="muted">已发现 {{ progress.found_games }} 个</span>
+          </div>
+          <div class="progress-bar"><i :style="{ width: pct + '%' }"></i></div>
+          <div class="faint" style="margin-top: 6px">
+            {{ progress.current || "准备中…" }}
+          </div>
+          <div style="display: flex; gap: 8px; margin-top: 12px">
+            <button v-if="!paused" @click="pause">暂停</button>
+            <button v-else @click="resume">继续</button>
+            <button class="danger" @click="cancel">取消</button>
+          </div>
+        </div>
+        <div v-else class="muted">当前没有正在进行的扫描</div>
+      </div>
+
+      <!-- 下栏：扫描按钮 + 路径条目 -->
+      <div class="section">
+        <h3>仓库路径</h3>
+
+        <div v-for="r in repos" :key="r.id" class="repo-item">
+          <div class="repo-head">
+            <div>
+              <span class="tag" :class="r.is_offline ? 'off' : 'ok'">
+                {{ r.is_offline ? "离线" : "已配置" }}
+              </span>
+              <span class="muted" style="margin-left: 8px">{{ r.name }}</span>
+            </div>
+            <div style="display: flex; gap: 6px">
+              <button :disabled="scanning || busy" @click="scan(r)">扫描</button>
+              <button @click="checkRepo(r)">检测</button>
+              <button class="danger" :disabled="scanning" @click="removeRepo(r)">删除</button>
+            </div>
+          </div>
+          <div class="repo-path">{{ r.locators.map((l) => l.path_template).join("  |  ") }}</div>
+          <div class="faint" style="margin-top: 4px">
+            上次扫描：{{ fmtTime(r.last_scan_at) }}
+          </div>
+        </div>
+
+        <div v-if="repos.length === 0" class="faint" style="padding: 12px 0">
+          还没有配置仓库路径
+        </div>
+
+        <button class="primary" style="margin-top: 6px" @click="showForm = !showForm">
+          {{ showForm ? "收起" : "添加路径" }}
+        </button>
+
+        <div v-if="showForm" class="repo-item" style="margin-top: 12px">
+          <div class="field">
+            <label>盘符路径 *</label>
+            <input v-model="form.drive" placeholder="例如 Z:\Game" />
+          </div>
+          <div class="field">
+            <label>IP 路径</label>
+            <input v-model="form.ip" placeholder="可选，例如 \\192.168.1.10\资源盘\Game" />
+          </div>
+          <div class="field">
+            <label>主机名路径</label>
+            <input v-model="form.host" placeholder="可选，例如 \\nas\资源盘\Game" />
+          </div>
+          <div class="faint" style="margin: 4px 0 12px">
+            盘符为必填；检测与扫描时按 盘符 → IP → 主机名 的可达性依次尝试。
+          </div>
+          <button class="primary" @click="addRepo">确认添加</button>
+        </div>
+      </div>
+    </div>
+
+    <div v-else>
+      <div class="section">
+        <h3>关于</h3>
+        <div class="kv">
+          <dt>版本号</dt>
+          <dd>{{ version }}</dd>
+          <dt>构筑版本号</dt>
+          <dd>{{ version }}</dd>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
