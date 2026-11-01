@@ -2,13 +2,17 @@
 .obsidian/
 
 # ---- Node ----
+logs
 node_modules/
 dist/
 dist-ssr/
 *.local
 .vite/
-pnpm-debug.log*
 npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
 
 # ---- Rust / Tauri ----
 src-tauri/target/
@@ -22,9 +26,15 @@ target/
 Thumbs.db
 .DS_Store
 
-# ---- IDE ----
-.vscode/
+# ---- 编辑器 ----
+.vscode/*
+!.vscode/extensions.json
 .idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
 
 # ---- 扫描探测中间产物 ----
 _probe/
