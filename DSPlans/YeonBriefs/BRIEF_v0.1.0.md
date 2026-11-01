@@ -17,7 +17,7 @@
 | Rust 后端 | 6 个模块：`db` / `models` / `error` / `scanner` / `locator` / `commands` / `state` |
 | SQLite | 7 张表：repositories、repository_locators、games、game_files、scan_jobs、scan_checkpoints、settings |
 | 前端 | 4 个视图：主页卡片墙 / 详情页 / 设置（仓库管理 + 关于）/ 侧边栏 |
-| 单元测试 | **22 个全部通过**（扫描器规则 13 + 定位探测 4 + 持久化 5） |
+| 单元测试 | **24 个全部通过**（扫描器规则 14 + 定位探测 4 + 持久化 6） |
 | 前端构建 | `vue-tsc --noEmit` 通过，`vite build` 通过（79.6 KB JS） |
 
 ## 2. 关键实现点（对照决策）
@@ -62,6 +62,8 @@
 | — | 续扫（mark_missing=false）不误标缺失 | ✅ |
 | — | schema 无 exe 字段/表、无版本字段（D19/D20 护栏） | ✅ |
 | — | 定位项可达性探测 ×4（含"盘符不可达回退 IP"） | ✅ |
+| T30 | 中文目录名 + 中文 exe → 正确建档 | ✅ |
+| — | 编号 / 封面不被自动填写（ACC-04-03/04） | ✅ |
 
 ### 2.5 真实仓库扫描结果（ACC-02-08）
 
