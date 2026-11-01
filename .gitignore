@@ -1,0 +1,30 @@
+# ---- Obsidian（各人配置不同，不纳入版本控制）----
+.obsidian/
+
+# ---- Node ----
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+pnpm-debug.log*
+npm-debug.log*
+
+# ---- Rust / Tauri ----
+src-tauri/target/
+target/
+**/*.rs.bk
+
+# ---- 日志与临时文件 ----
+*.log
+*.tmp
+*.bak
+Thumbs.db
+.DS_Store
+
+# ---- IDE ----
+.vscode/
+.idea/
+
+# ---- 扫描探测中间产物 ----
+_probe/
