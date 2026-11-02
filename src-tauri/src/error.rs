@@ -19,6 +19,15 @@ pub enum AppError {
     #[error("档案不存在: {0}")]
     GameNotFound(i64),
 
+    #[error("版本不存在: {0}")]
+    VersionNotFound(i64),
+
+    #[error("可执行文件配置不存在: {0}")]
+    ExecutableNotFound(i64),
+
+    #[error("黑名单记录不存在: {0}")]
+    BlocklistNotFound(i64),
+
     #[error("已有扫描任务在运行（ScanBusy）")]
     ScanBusy,
 
@@ -51,6 +60,9 @@ impl Serialize for AppError {
             AppError::Regex(_) => "regex",
             AppError::RepositoryNotFound(_) => "repository_not_found",
             AppError::GameNotFound(_) => "game_not_found",
+            AppError::VersionNotFound(_) => "version_not_found",
+            AppError::ExecutableNotFound(_) => "executable_not_found",
+            AppError::BlocklistNotFound(_) => "blocklist_not_found",
             AppError::ScanBusy => "scan_busy",
             AppError::ScanInProgress => "scan_in_progress",
             AppError::NoActiveScan => "no_active_scan",

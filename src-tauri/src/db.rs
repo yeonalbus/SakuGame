@@ -1,5 +1,5 @@
 //! SQLite 持久化层。
-//! 依据：DSPlans/MVPv1扫描器规格.md §6（含 D16 的 repository_locators、D10 的 scan_checkpoints）
+//! 依据：DSPlans/MVPv1.1技术规格.md §5（schema v2）、§5 迁移说明（v1 数据不迁移）
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -29,11 +29,21 @@ impl Db {
     }
 
     fn init_schema(&self) -> AppResult<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| AppError::Internal(e.to_string()))?;
+
+        // v1 → v1.1：不迁移，检测到旧结构（games 无 layout 列）即清空业务表重建
+        if table_exists(&conn, "games")? && !table_has_column(&conn, "games", "layout")? {
+            conn.execute_batch(DROP_V1_BUSINESS_TABLES)?;
+        }
+
         conn.execute_batch(SCHEMA)?;
         conn.execute(
-            "INSERT OR IGNORE INTO settings(key, value) VALUES('schema_version', ?1)",
+            "INSERT OR REPLACE INTO settings(key, value) VALUES('schema_version', ?1)",
             [SCHEMA_VERSION.to_string()],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES('root_excluded_dirs', ?1)",
+            [DEFAULT_ROOT_EXCLUDED_DIRS],
         )?;
         Ok(())
     }
@@ -51,10 +61,44 @@ impl Db {
         let mut conn = self.conn.lock().map_err(|e| AppError::Internal(e.to_string()))?;
         f(&mut conn)
     }
+
+    /// 读取字符串设置项
+    pub fn get_setting(&self, key: &str) -> AppResult<Option<String>> {
+        self.with(|conn| {
+            let v = conn
+                .query_row("SELECT value FROM settings WHERE key=?1", [key], |r| r.get(0))
+                .ok();
+            Ok(v)
+        })
+    }
+
+    /// 写入字符串设置项
+    pub fn set_setting(&self, key: &str, value: &str) -> AppResult<()> {
+        self.with(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO settings(key, value) VALUES(?1, ?2)",
+                [key, value],
+            )?;
+            Ok(())
+        })
+    }
 }
 
-/// v1 schema。所有表结构变更都必须追加版本号（见 settings.schema_version）。
-pub const SCHEMA_VERSION: i32 = 1;
+/// v1.1 schema。所有表结构变更都必须追加版本号（见 settings.schema_version）。
+pub const SCHEMA_VERSION: i32 = 2;
+
+/// 仓库根级目录排除名单默认值（JSON 数组；支持结尾 `*` 前缀通配，大小写不敏感）
+pub const DEFAULT_ROOT_EXCLUDED_DIRS: &str = r##"["#recycle","@eaDir","#snapshot","$RECYCLE.BIN","System Volume Information","lost+found",".Trash*",".DS_Store"]"##;
+
+/// v1 旧业务表（清空重建用；按外键依赖顺序：先子表后主表）
+const DROP_V1_BUSINESS_TABLES: &str = r#"
+DROP TABLE IF EXISTS game_files;
+DROP TABLE IF EXISTS game_version_files;
+DROP TABLE IF EXISTS game_version_executables;
+DROP TABLE IF EXISTS game_versions;
+DROP TABLE IF EXISTS games;
+DROP TABLE IF EXISTS blocklist;
+"#;
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -81,33 +125,73 @@ CREATE TABLE IF NOT EXISTS repository_locators (
     UNIQUE (repository_id, kind)
 );
 
--- 游戏档案（D17：粒度 = 目录；D19：无 exe 字段；D20：无版本字段）
--- group_key：Q-B 匹配键追加组键（同一目录多个压缩包组时各建一条档案；folder 型为空串）
+-- 游戏档案（= 游戏标识层，一层一条；v1.1 两层结构）
 CREATE TABLE IF NOT EXISTS games (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    repository_id  INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
-    relative_path  TEXT    NOT NULL,
-    group_key      TEXT    NOT NULL DEFAULT '',
-    game_type      TEXT    NOT NULL CHECK (game_type IN ('folder','archive')),
-    display_name   TEXT    NOT NULL,
-    game_code      TEXT,
-    cover_path     TEXT,
-    size_bytes     INTEGER NOT NULL DEFAULT 0,
-    status         TEXT    NOT NULL DEFAULT 'ok' CHECK (status IN ('ok','missing')),
-    created_at     TEXT    NOT NULL,
-    updated_at     TEXT    NOT NULL,
-    UNIQUE (repository_id, relative_path, group_key)
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    repository_id       INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    relative_path       TEXT    NOT NULL,
+    layout              TEXT    NOT NULL CHECK (layout IN ('compact','standard')),
+    display_name        TEXT    NOT NULL,
+    game_code           TEXT,
+    cover_path          TEXT,
+    size_bytes          INTEGER NOT NULL DEFAULT 0,
+    selected_version_id INTEGER,
+    status              TEXT    NOT NULL DEFAULT 'ok' CHECK (status IN ('ok','missing')),
+    created_at          TEXT    NOT NULL,
+    updated_at          TEXT    NOT NULL,
+    UNIQUE (repository_id, relative_path)
 );
 
--- 压缩包型游戏的文件清单（D6：分卷聚合）
-CREATE TABLE IF NOT EXISTS game_files (
+-- 版本（= 版本标识层；紧凑型为游戏标识层自身）
+CREATE TABLE IF NOT EXISTS game_versions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_id       INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+    relative_path TEXT    NOT NULL,
+    version_label TEXT    NOT NULL,
+    display_name  TEXT    NOT NULL,
+    note          TEXT,
+    game_type     TEXT    NOT NULL CHECK (game_type IN ('folder','archive')),
+    size_bytes    INTEGER NOT NULL DEFAULT 0,
+    source        TEXT    NOT NULL DEFAULT 'scan' CHECK (source IN ('scan','manual')),
+    status        TEXT    NOT NULL DEFAULT 'ok' CHECK (status IN ('ok','missing')),
+    created_at    TEXT    NOT NULL,
+    updated_at    TEXT    NOT NULL,
+    UNIQUE (game_id, relative_path)
+);
+
+-- 版本内候选 / 手填可执行文件
+CREATE TABLE IF NOT EXISTS game_version_executables (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id    INTEGER NOT NULL REFERENCES game_versions(id) ON DELETE CASCADE,
+    relative_path TEXT    NOT NULL,
+    file_name     TEXT    NOT NULL,
+    size_bytes    INTEGER NOT NULL DEFAULT 0,
+    is_selected   INTEGER NOT NULL DEFAULT 0,
+    source        TEXT    NOT NULL CHECK (source IN ('scan','manual')),
+    invalid       INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT    NOT NULL,
+    UNIQUE (version_id, relative_path)
+);
+
+-- 版本内压缩包文件（v2 搬运依据；group_key 仅表示分卷组）
+CREATE TABLE IF NOT EXISTS game_version_files (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    game_id    INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+    version_id INTEGER NOT NULL REFERENCES game_versions(id) ON DELETE CASCADE,
     group_key  TEXT    NOT NULL,
     file_name  TEXT    NOT NULL,
     part_index INTEGER,
     size_bytes INTEGER NOT NULL,
-    UNIQUE (game_id, group_key, file_name)
+    UNIQUE (version_id, file_name)
+);
+
+-- 黑名单（删除的档案 / 版本，防止重扫重复判定）
+CREATE TABLE IF NOT EXISTS blocklist (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    kind          TEXT    NOT NULL CHECK (kind IN ('game','version')),
+    relative_path TEXT    NOT NULL,
+    created_at    TEXT    NOT NULL,
+    UNIQUE (repository_id, kind, relative_path)
 );
 
 -- 扫描任务历史（留痕用于排查）
@@ -137,7 +221,129 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_games_repo_status ON games(repository_id, status);
+CREATE INDEX IF NOT EXISTS idx_games_repo_status  ON games(repository_id, status);
 CREATE INDEX IF NOT EXISTS idx_games_display_name ON games(display_name);
-CREATE INDEX IF NOT EXISTS idx_game_files_game ON game_files(game_id);
+CREATE INDEX IF NOT EXISTS idx_versions_game      ON game_versions(game_id);
+CREATE INDEX IF NOT EXISTS idx_exes_version       ON game_version_executables(version_id);
+CREATE INDEX IF NOT EXISTS idx_vfiles_version     ON game_version_files(version_id);
+CREATE INDEX IF NOT EXISTS idx_blocklist_repo     ON blocklist(repository_id, kind);
 "#;
+
+fn table_exists(conn: &Connection, name: &str) -> AppResult<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        [name],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> AppResult<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(cols.iter().any(|c| c.eq_ignore_ascii_case(column)))
+}
+
+// ---------------------------------------------------------------------------
+// 测试
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db(tag: &str) -> (Db, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "sakugame_db_{}_{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.db");
+        (Db::open(&path).expect("open db"), dir)
+    }
+
+    /// ACC-CON-01 / D19 护栏：games 表不得含 exe 字段、不得含版本号字段
+    #[test]
+    fn schema_v2_columns() {
+        let (db, dir) = temp_db("cols");
+        db.with(|c| {
+            let mut stmt = c.prepare("PRAGMA table_info(games)")?;
+            let cols: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            assert!(cols.iter().any(|c| c == "layout"), "games 应有 layout 列: {cols:?}");
+            assert!(
+                !cols.iter().any(|c| c.to_lowercase().contains("exe")),
+                "games 不得有 exe 字段（D19）"
+            );
+            assert!(
+                !cols.iter().any(|c| c.to_lowercase().contains("version_id") && c != "selected_version_id"),
+                "除 selected_version_id 外不得有版本关联列"
+            );
+
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN
+                 ('game_versions','game_version_executables','game_version_files','blocklist')",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(n, 4, "v2 应建齐版本 / 可执行文件 / 压缩包 / 黑名单四张表");
+            Ok(())
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// schema_version 与默认目录排除名单已写入
+    #[test]
+    fn schema_meta_written() {
+        let (db, dir) = temp_db("meta");
+        assert_eq!(
+            db.get_setting("schema_version").unwrap().as_deref(),
+            Some("2")
+        );
+        let excluded = db.get_setting("root_excluded_dirs").unwrap().unwrap();
+        assert!(excluded.contains("#recycle") && excluded.contains("@eaDir"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v1 旧库（games 无 layout 列）→ 清空重建
+    #[test]
+    fn migrate_from_v1_drops_business_tables() {
+        let dir = std::env::temp_dir().join(format!("sakugame_db_v1_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE games(id INTEGER PRIMARY KEY, repository_id INTEGER,
+                    relative_path TEXT, group_key TEXT, game_type TEXT, display_name TEXT,
+                    size_bytes INTEGER, status TEXT, created_at TEXT, updated_at TEXT);
+                 CREATE TABLE game_files(id INTEGER PRIMARY KEY, game_id INTEGER);
+                 INSERT INTO games(id, repository_id, relative_path, group_key, game_type,
+                    display_name, size_bytes, status, created_at, updated_at)
+                 VALUES(1, 1, 'RJ1234/Ver1.0', '', 'folder', 'Ver1.0', 1, 'ok', 'x', 'x');",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        db.with(|c| {
+            let n: i64 = c.query_row("SELECT COUNT(*) FROM games", [], |r| r.get(0))?;
+            assert_eq!(n, 0, "v1 数据不迁移，应被清空");
+            let has_layout = table_has_column(c, "games", "layout")?;
+            assert!(has_layout);
+            Ok(())
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

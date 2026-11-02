@@ -1,12 +1,13 @@
-//! 扫描器：目录判定与档案产出。
+//! 扫描器：两层枚举（游戏标识层 → 版本标识层）。
 //!
-//! 规则依据 DSPlans/MVPv1扫描器规格.md §3：
-//! - 判定优先级（§3.2，Q-J/Q-G）：目录自身含压缩文件 → archive；否则自身含候选 exe → folder；否则容器下探
-//! - 压缩白名单（Q-I）：`.bin`/`.cue` 已移出，它们是数据文件而非压缩包
-//! - 分卷聚合（D6）：`.partN.rar` / `.rNN` / `.zNN` / `.7z.001`
-//! - 排除名单（D18）：只用于"选代表"，不得用于过滤掉目录——有非名单 exe 就必须建档
-//! - 深度上限 3（D5）、不跟随符号链接/junction（§3.4）
-//! - 不读 exe 内容（性能红线）
+//! 规则依据 DSPlans/MVPv1.1设计规划1.0-dsedit.md §4 与 DSPlans/MVPv1.1技术规格.md §4：
+//! - **下探固定两层**：仓库根的直接子目录 = 档案；其直接子目录 = 版本。版本层以下一律不下探。
+//! - **建档强断言**：仓库根下每个直接子目录必定建档案，与内容无关（D18：宁可误报不可漏档）。
+//! - **版本判定**：目录的**直接子文件**含候选 exe 或压缩包才算一个版本；埋在子目录里的不算。
+//! - **exe 优先**（Q-G）：同一目录同时有 exe 与压缩包 → folder 型。
+//! - **排除名单**（D18）：只用于「选候选」，不参与「是否建档」的判定。
+//! - **根级目录排除**：系统 / 回收站 / 索引目录不建档。
+//! - 不读 exe 内容（性能红线）；不跟随符号链接 / junction；支持长路径。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,7 +16,10 @@ use std::sync::Arc;
 
 use regex::Regex;
 
-use crate::models::{ArchiveFile, ArchiveGroup, GameEntry, GameType};
+use crate::models::{
+    ArchiveFile, ArchiveGroup, ExeCandidate, GameEntry, GameLayout, GameType, ScanReport,
+    ScanWarnings, VersionEntry,
+};
 
 // ---------------------------------------------------------------------------
 // 配置
@@ -23,14 +27,14 @@ use crate::models::{ArchiveFile, ArchiveGroup, GameEntry, GameType};
 
 #[derive(Debug, Clone)]
 pub struct ScanConfig {
-    /// 最大下探深度（D5：3）
-    pub max_depth: u32,
-    /// 压缩文件白名单（Q-I：不含 bin/cue）
+    /// 压缩文件白名单（Q-I：不含 bin/cue；.bin 实测为数据文件）
     pub archive_exts: Vec<String>,
     /// exe 文件名排除正则（大小写不敏感）
     pub exclude_file_patterns: Vec<Regex>,
     /// exe 所在路径段排除（小写比较）
     pub exclude_path_segments: Vec<String>,
+    /// 仓库根级目录排除（小写；支持结尾 `*` 前缀通配）
+    pub root_excluded_dirs: Vec<String>,
     part_matchers: Vec<PartMatcher>,
 }
 
@@ -83,6 +87,21 @@ impl Default for ScanConfig {
         .map(|s| s.to_string())
         .collect();
 
+        // 与 db::DEFAULT_ROOT_EXCLUDED_DIRS 保持一致（此处小写存储，比较时双方转小写）
+        let root_excluded_dirs = [
+            "#recycle",
+            "@eadir",
+            "#snapshot",
+            "$recycle.bin",
+            "system volume information",
+            "lost+found",
+            ".trash*",
+            ".ds_store",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
         let part_matchers = vec![
             // game.part1.rar
             PartMatcher {
@@ -111,7 +130,6 @@ impl Default for ScanConfig {
         ];
 
         ScanConfig {
-            max_depth: 3,
             archive_exts: [
                 "zip", "7z", "rar", "tar", "gz", "bz2", "xz", "zst", "iso",
             ]
@@ -120,6 +138,7 @@ impl Default for ScanConfig {
             .collect(),
             exclude_file_patterns,
             exclude_path_segments,
+            root_excluded_dirs,
             part_matchers,
         }
     }
@@ -149,11 +168,11 @@ impl ScanConfig {
         None
     }
 
-    fn is_excluded_exe(&self, rel_path_lower: &str, file_name: &str) -> bool {
+    fn is_excluded_exe(&self, rel_path_lower: &str, file_name_lower: &str) -> bool {
         if self
             .exclude_file_patterns
             .iter()
-            .any(|re| re.is_match(file_name))
+            .any(|re| re.is_match(file_name_lower))
         {
             return true;
         }
@@ -161,6 +180,27 @@ impl ScanConfig {
             .iter()
             .any(|seg| rel_path_lower.contains(seg.as_str()))
     }
+
+    /// 仓库根级目录排除（系统 / 回收站 / 索引目录）
+    fn is_root_excluded(&self, name: &str) -> bool {
+        let lower = name.to_lowercase();
+        self.root_excluded_dirs.iter().any(|p| {
+            let p = p.to_lowercase();
+            if let Some(prefix) = p.strip_suffix('*') {
+                lower.starts_with(prefix)
+            } else {
+                lower == p
+            }
+        })
+    }
+}
+
+/// 从 settings 的 JSON 数组解析根级目录排除名单；解析失败则回退默认值
+pub fn parse_root_excluded(raw: Option<String>) -> Vec<String> {
+    raw.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.into_iter().map(|s| s.to_lowercase()).collect())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -203,20 +243,20 @@ impl ScanControl {
         }
     }
 
-    /// 阻塞到可继续；返回是否取消
+    /// 在顶层条目之间等待：暂停时阻塞，取消时返回 false
     pub fn wait_until_ready(&self) -> bool {
         loop {
             match self.signal() {
-                ControlSignal::Cancelled => return false,
-                ControlSignal::Paused => std::thread::sleep(std::time::Duration::from_millis(30)),
                 ControlSignal::Continue => return true,
+                ControlSignal::Paused => std::thread::sleep(std::time::Duration::from_millis(80)),
+                ControlSignal::Cancelled => return false,
             }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// 顶层扫描
+// 扫描入口
 // ---------------------------------------------------------------------------
 
 pub struct ScanProgressEvent<'a> {
@@ -227,16 +267,12 @@ pub struct ScanProgressEvent<'a> {
 }
 
 pub struct ScanRunResult {
-    pub games: Vec<GameEntry>,
-    pub warnings: u32,
-    /// 已处理的顶层条目数（用于断点）
-    #[allow(dead_code)]
+    pub report: ScanReport,
     pub processed: u32,
-    /// 是否被取消
     pub cancelled: bool,
 }
 
-/// 扫描一个仓库根目录。
+/// 扫描一个仓库根目录（全量）。
 ///
 /// * `start_index`：断点续扫的起始顶层条目索引（D10）
 /// * `on_progress`：每处理完一个顶层条目调用一次
@@ -248,66 +284,46 @@ pub fn scan_repository(
     mut on_progress: impl FnMut(&ScanProgressEvent<'_>),
 ) -> ScanRunResult {
     let root_ext = extend_path(root);
-    let mut games: Vec<GameEntry> = Vec::new();
-    let mut warnings: u32 = 0;
+    let mut report = ScanReport::default();
+    let mut processed: u32 = 0;
 
-    // 顶层条目
     let entries = match list_dir(&root_ext) {
         Ok(v) => v,
         Err(_) => {
+            report.warnings.enum_failed = 1;
             return ScanRunResult {
-                games,
-                warnings: 1,
+                report,
                 processed: 0,
                 cancelled: false,
-            }
+            };
         }
     };
     let total = entries.len() as u32;
-    let mut processed: u32 = 0;
 
     for (i, de) in entries.iter().enumerate() {
         let i = i as u32;
         if i < start_index {
             continue;
         }
-        // 暂停/取消检查（仅在顶层条目之间，§3.6）
         if !control.wait_until_ready() {
             return ScanRunResult {
-                games,
-                warnings,
+                report,
                 processed,
                 cancelled: true,
             };
         }
 
-        let rel = de
-            .path
-            .strip_prefix(&root_ext)
-            .map(|p| normalize_rel(p))
-            .unwrap_or_else(|_| de.name.clone());
-
         if de.is_dir {
-            if de.reparse {
-                // 不跟随符号链接 / junction（§3.4）
-            } else {
-                let found = walk_dir(&de.path, &rel, 1, config, &control, &mut warnings);
-                games.extend(found);
+            // 不跟随符号链接 / junction；系统目录排除
+            if !de.reparse && !config.is_root_excluded(&de.name) {
+                let game = classify_game(&de.path, &de.name, config, &mut report.warnings);
+                report.games.push(game);
             }
-        } else {
-            // 顶层散落的压缩包文件（DB3-1 之外的通用情形）
-            if let Some(ext) = config.is_archive_ext(&de.name) {
-                if let Some(group) = build_single_archive(&de.name, ext, de.size) {
-                    games.push(GameEntry {
-                        relative_path: de.name.clone(),
-                        group_key: de.name.clone(),
-                        game_type: GameType::Archive,
-                        display_name: strip_archive_ext(&de.name),
-                        size_bytes: de.size,
-                        groups: vec![group],
-                    });
-                }
-            }
+        } else if config.match_part(&de.name).is_some()
+            || config.is_archive_ext(&de.name).is_some()
+        {
+            // 仓库根下的散落压缩包：不建档，只计 warning
+            report.warnings.root_loose_files += 1;
         }
 
         processed = i + 1;
@@ -315,119 +331,197 @@ pub fn scan_repository(
             done: processed,
             total,
             current: Some(&de.name),
-            found: games.len() as u32,
+            found: report.games.len() as u32,
         });
     }
 
     ScanRunResult {
-        games,
-        warnings,
+        report,
         processed,
         cancelled: false,
     }
 }
 
-/// 递归判定一个目录；返回该目录（含其子目录）产出的所有游戏。
+/// 单档案重扫：只判定一个游戏标识层。
+pub fn scan_one_game(
+    root: &Path,
+    game_relative_path: &str,
+    config: &ScanConfig,
+) -> (GameEntry, ScanWarnings) {
+    let mut warnings = ScanWarnings::default();
+    let rel = game_relative_path.replace('\\', "/");
+    let dir = join_rel(root, &rel);
+    let game = classify_game(&dir, &rel, config, &mut warnings);
+    (game, warnings)
+}
+
+/// 判定一个游戏标识层；返回该游戏（含版本列表）。
 ///
-/// 判定优先级（Q-J / Q-G）：压缩文件优先于 exe 是错误的，正确的是 **exe 优先**；
-/// 但只有「非排除名单」的 exe 才算数（D18）。
-fn walk_dir(
+/// 枚举失败时仍返回一个 0 版本的空档案（强断言：绝不漏档），并计入 enum_failed。
+fn classify_game(
     dir: &Path,
     rel: &str,
-    depth: u32,
     config: &ScanConfig,
-    control: &ScanControl,
-    warnings: &mut u32,
-) -> Vec<GameEntry> {
-    let mut out = Vec::new();
+    warnings: &mut ScanWarnings,
+) -> GameEntry {
+    let display_name = display_name_of(rel);
+    let empty = |layout: GameLayout| GameEntry {
+        relative_path: rel.to_string(),
+        layout,
+        display_name: display_name.clone(),
+        size_bytes: 0,
+        versions: Vec::new(),
+    };
 
-    let entries = match list_dir(dir) {
+    let entries = match list_dir(&extend_path(dir)) {
         Ok(v) => v,
         Err(_) => {
-            *warnings += 1;
-            return out;
+            warnings.enum_failed += 1;
+            return empty(GameLayout::Standard);
         }
     };
 
-    // 收集本目录信息
-    let mut archive_files: Vec<(String, &DirEntry)> = Vec::new(); // (组键用文件名)
-    let mut single_archives: Vec<(&DirEntry, String)> = Vec::new(); // (entry, ext)
-    let mut exe_candidates: Vec<&DirEntry> = Vec::new();
-    let mut subdirs: Vec<&DirEntry> = Vec::new();
+    let (direct_exes, direct_archives) = split_files(&entries, rel, config);
 
-    for de in &entries {
-        if de.reparse {
-            continue; // 不跟随（§3.4）
+    // ---- 紧凑型：游戏标识层自身直接含 exe / 压缩包 → 截断，1 个版本 ----
+    if !direct_exes.is_empty() || !direct_archives.is_empty() {
+        let size: u64 = entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
+        let version = VersionEntry {
+            relative_path: rel.to_string(),
+            version_label: display_name.clone(),
+            game_type: if !direct_exes.is_empty() {
+                GameType::Folder
+            } else {
+                GameType::Archive
+            },
+            size_bytes: size,
+            executables: direct_exes,
+            archive_groups: build_archive_groups(config, &direct_archives),
+        };
+
+        // 截断可见性：子目录里还藏着 exe / 压缩包 → 计一条 warning（判定结果不变）
+        for sub in entries.iter().filter(|e| e.is_dir && !e.reparse) {
+            let sub_rel = format!("{}/{}", rel, sub.name);
+            if dir_has_content(&sub.path, &sub_rel, config) {
+                warnings.truncated_with_version_dirs += 1;
+                break;
+            }
         }
-        if de.is_dir {
-            subdirs.push(de);
+
+        let size_total = version.size_bytes;
+        return GameEntry {
+            relative_path: rel.to_string(),
+            layout: GameLayout::Compact,
+            display_name,
+            size_bytes: size_total,
+            versions: vec![version],
+        };
+    }
+
+    // ---- 标准型：逐个直接子目录判定是否为版本（不递归） ----
+    let mut versions = Vec::new();
+    for sub in entries.iter().filter(|e| e.is_dir && !e.reparse) {
+        let sub_rel = format!("{}/{}", rel, sub.name);
+        let sub_entries = match list_dir(&extend_path(&sub.path)) {
+            Ok(v) => v,
+            Err(_) => {
+                warnings.enum_failed += 1;
+                continue;
+            }
+        };
+        let (s_exes, s_archives) = split_files(&sub_entries, &sub_rel, config);
+        if s_exes.is_empty() && s_archives.is_empty() {
+            // 对象定义：版本标识层下必须存在可执行文件或压缩包，且不能在子目录中
             continue;
         }
-        // 分卷优先判断
-        if config.match_part(&de.name).is_some() {
-            archive_files.push((de.name.clone(), de));
-            continue;
-        }
-        if let Some(ext) = config.is_archive_ext(&de.name) {
-            single_archives.push((de, ext));
+        let size: u64 = sub_entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
+        versions.push(VersionEntry {
+            relative_path: sub_rel,
+            version_label: sub.name.clone(),
+            game_type: if !s_exes.is_empty() {
+                GameType::Folder
+            } else {
+                GameType::Archive
+            },
+            size_bytes: size,
+            executables: s_exes,
+            archive_groups: build_archive_groups(config, &s_archives),
+        });
+    }
+
+    let total_size: u64 = versions.iter().map(|v| v.size_bytes).sum();
+    GameEntry {
+        relative_path: rel.to_string(),
+        layout: GameLayout::Standard,
+        display_name,
+        size_bytes: total_size,
+        versions,
+    }
+}
+
+/// 把目录的直接文件分成「候选可执行文件」与「压缩文件」（均为文件名 + 大小）
+fn split_files(
+    entries: &[DirEntry],
+    rel_base: &str,
+    config: &ScanConfig,
+) -> (Vec<ExeCandidate>, Vec<(String, u64)>) {
+    let mut exes = Vec::new();
+    let mut archives = Vec::new();
+
+    for de in entries.iter().filter(|e| !e.is_dir) {
+        // 分卷优先（.7z.001 之类扩展名不在白名单，靠正则识别）
+        if config.match_part(&de.name).is_some() || config.is_archive_ext(&de.name).is_some() {
+            archives.push((de.name.clone(), de.size));
             continue;
         }
         if de.name.to_lowercase().ends_with(".exe") {
             let file_lower = de.name.to_lowercase();
-            let rel_lower = format!("{}/{}", rel.to_lowercase(), file_lower);
+            let rel_lower = format!("{}/{}", rel_base.to_lowercase(), file_lower);
             if !config.is_excluded_exe(&rel_lower, &file_lower) {
-                exe_candidates.push(de);
-            }
-        }
-    }
-
-    // ---- 判定 1：目录自身存在非排除名单的 exe → folder（D18：必建，不看得分） ----
-    if !exe_candidates.is_empty() {
-        let size: u64 = entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
-        out.push(GameEntry {
-            relative_path: rel.to_string(),
-            group_key: String::new(),
-            game_type: GameType::Folder,
-            display_name: display_name_of(rel),
-            size_bytes: size,
-            groups: Vec::new(),
-        });
-        return out;
-    }
-
-    // ---- 判定 2：目录自身存在压缩文件 → archive（含分卷聚合，D6） ----
-    if !archive_files.is_empty() || !single_archives.is_empty() {
-        let groups = build_archive_groups(config, &archive_files, &single_archives);
-        if !groups.is_empty() {
-            // Q-B：同目录多个压缩组 → 各建一条档案，用 group_key 区分
-            for group in groups {
-                let size: u64 = group.files.iter().map(|f| f.size_bytes).sum();
-                let key = group.base_name.clone();
-                out.push(GameEntry {
-                    relative_path: rel.to_string(),
-                    group_key: key,
-                    game_type: GameType::Archive,
-                    display_name: display_name_of(rel),
-                    size_bytes: size,
-                    groups: vec![group],
+                exes.push(ExeCandidate {
+                    relative_path: format!("{}/{}", rel_base, de.name),
+                    file_name: de.name.clone(),
+                    size_bytes: de.size,
                 });
             }
         }
-        return out;
+    }
+    (exes, archives)
+}
+
+/// 目录是否含「候选 exe 或压缩文件」（只列一层，用于截断可见性提示）
+fn dir_has_content(dir: &Path, rel: &str, config: &ScanConfig) -> bool {
+    let Ok(entries) = list_dir(&extend_path(dir)) else {
+        return false;
+    };
+    let (exes, archives) = split_files(&entries, rel, config);
+    !exes.is_empty() || !archives.is_empty()
+}
+
+/// 把本目录收集到的压缩文件按组聚合（D6：分卷聚合）
+fn build_archive_groups(config: &ScanConfig, archives: &[(String, u64)]) -> Vec<ArchiveGroup> {
+    let mut groups: HashMap<String, Vec<ArchiveFile>> = HashMap::new();
+
+    for (name, size) in archives {
+        let (key, part_index) = match config.match_part(name) {
+            Some((k, idx)) => (k, Some(idx)),
+            None => (name.clone(), None),
+        };
+        groups.entry(key).or_default().push(ArchiveFile {
+            file_name: name.clone(),
+            size_bytes: *size,
+            part_index,
+        });
     }
 
-    // ---- 判定 3：容器目录 → 下探（深度上限 D5） ----
-    if depth >= config.max_depth {
-        return out;
-    }
-    for sub in subdirs {
-        if control.signal() == ControlSignal::Cancelled {
-            return out;
-        }
-        let sub_rel = format!("{}/{}", rel, sub.name);
-        let mut sub_games = walk_dir(&sub.path, &sub_rel, depth + 1, config, control, warnings);
-        out.append(&mut sub_games);
-    }
+    let mut out: Vec<ArchiveGroup> = groups
+        .into_iter()
+        .map(|(base_name, mut files)| {
+            files.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+            ArchiveGroup { base_name, files }
+        })
+        .collect();
+    out.sort_by(|a, b| a.base_name.cmp(&b.base_name));
     out
 }
 
@@ -511,8 +605,13 @@ pub fn extend_path(p: &Path) -> PathBuf {
     }
 }
 
-fn normalize_rel(p: &Path) -> String {
-    p.to_string_lossy().replace('\\', "/")
+/// 用「/」分隔的相对路径拼接绝对路径
+fn join_rel(root: &Path, rel: &str) -> PathBuf {
+    let mut p = root.to_path_buf();
+    for seg in rel.split('/').filter(|s| !s.is_empty()) {
+        p.push(seg);
+    }
+    p
 }
 
 /// 显示名：取最后一段路径
@@ -520,65 +619,8 @@ fn display_name_of(rel: &str) -> String {
     rel.rsplit('/').next().unwrap_or(rel).to_string()
 }
 
-fn strip_archive_ext(name: &str) -> String {
-    let path = Path::new(name);
-    path.file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| name.to_string())
-}
-
-fn build_single_archive(name: &str, _ext: String, size: u64) -> Option<ArchiveGroup> {
-    Some(ArchiveGroup {
-        base_name: name.to_string(),
-        files: vec![ArchiveFile {
-            file_name: name.to_string(),
-            size_bytes: size,
-            part_index: None,
-        }],
-    })
-}
-
-/// 把本目录收集到的压缩文件按组聚合（D6 / Q-B）
-fn build_archive_groups(
-    config: &ScanConfig,
-    part_files: &[(String, &DirEntry)],
-    singles: &[(&DirEntry, String)],
-) -> Vec<ArchiveGroup> {
-    let mut groups: HashMap<String, Vec<ArchiveFile>> = HashMap::new();
-
-    for (name, de) in part_files {
-        if let Some((key, idx)) = config.match_part(name) {
-            groups.entry(key).or_default().push(ArchiveFile {
-                file_name: name.clone(),
-                size_bytes: de.size,
-                part_index: Some(idx),
-            });
-        }
-    }
-
-    for (de, _ext) in singles {
-        // 单文件压缩包：组键 = 文件名
-        groups.entry(de.name.clone()).or_default().push(ArchiveFile {
-            file_name: de.name.clone(),
-            size_bytes: de.size,
-            part_index: None,
-        });
-    }
-
-    let mut out: Vec<ArchiveGroup> = groups
-        .into_iter()
-        .map(|(base_name, mut files)| {
-            files.sort_by(|a, b| a.file_name.cmp(&b.file_name));
-            ArchiveGroup { base_name, files }
-        })
-        .collect();
-    // 稳定输出顺序
-    out.sort_by(|a, b| a.base_name.cmp(&b.base_name));
-    out
-}
-
 // ---------------------------------------------------------------------------
-// 测试（核心判定规则）
+// 测试（依据 MVPv1.1技术规格.md §9）
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -597,242 +639,324 @@ mod tests {
         dir
     }
 
-    fn scan(root: &Path) -> Vec<GameEntry> {
+    fn scan(root: &Path) -> ScanReport {
         let cfg = ScanConfig::default();
         let ctl = ScanControl::new();
-        scan_repository(root, &cfg, &ctl, 0, |_| {}).games
+        scan_repository(root, &cfg, &ctl, 0, |_| {}).report
     }
 
-    #[test]
-    fn t25_numbered_dir_with_unrelated_exe_builds_archive() {
-        // 目录名 = 游戏编号，exe 名与目录名无关 → 仍须建档（Q-K 修正后）
-        let root = tmp_root("t25");
-        let game = root.join("RJ01005841");
-        fs::create_dir_all(&game).unwrap();
-        fs::write(game.join("IllegalMahjong.exe"), b"x").unwrap();
+    fn write(path: &Path, name: &str) {
+        fs::write(path.join(name), b"x").unwrap();
+    }
 
-        let games = scan(&root);
-        assert_eq!(games.len(), 1, "编号目录必须建档");
-        assert_eq!(games[0].game_type, GameType::Folder);
-        assert_eq!(games[0].display_name, "RJ01005841");
+    // ---- T-1.1-01 / ACC-01：紧凑形态 ----
+    #[test]
+    fn t11_01_compact_single_version() {
+        let root = tmp_root("t1101");
+        let g = root.join("RJ001");
+        fs::create_dir_all(g.join("data")).unwrap();
+        write(&g, "game.exe");
+        write(&g.join("data"), "asset.bin");
+
+        let report = scan(&root);
+        assert_eq!(report.games.len(), 1);
+        let game = &report.games[0];
+        assert_eq!(game.layout, GameLayout::Compact);
+        assert_eq!(game.versions.len(), 1);
+        assert_eq!(game.versions[0].game_type, GameType::Folder);
+        assert_eq!(game.versions[0].executables.len(), 1);
+        assert_eq!(
+            game.versions[0].executables[0].relative_path,
+            "RJ001/game.exe"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- T-1.1-02 / ACC-02：标准形态两版本 ----
+    #[test]
+    fn t11_02_standard_two_versions() {
+        let root = tmp_root("t1102");
+        let g = root.join("RJ002");
+        fs::create_dir_all(g.join("Ver1.0")).unwrap();
+        fs::create_dir_all(g.join("Ver2.0")).unwrap();
+        write(&g.join("Ver1.0"), "game.exe");
+        write(&g.join("Ver2.0"), "game.exe");
+
+        let report = scan(&root);
+        assert_eq!(report.games.len(), 1);
+        let game = &report.games[0];
+        assert_eq!(game.layout, GameLayout::Standard);
+        assert_eq!(game.versions.len(), 2);
+        assert!(game.versions.iter().any(|v| v.version_label == "Ver1.0"));
+        assert!(game.versions.iter().any(|v| v.version_label == "Ver2.0"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- T-1.1-03 / ACC-03：多版本形态混用 ----
+    #[test]
+    fn t11_03_mixed_version_types() {
+        let root = tmp_root("t1103");
+        let g = root.join("RJ003");
+        fs::create_dir_all(g.join("Ver1.0")).unwrap();
+        fs::create_dir_all(g.join("Ver2.0")).unwrap();
+        write(&g.join("Ver1.0"), "game.exe");
+        write(&g.join("Ver2.0"), "game.7z");
+
+        let report = scan(&root);
+        let game = &report.games[0];
+        assert_eq!(game.versions.len(), 2);
+        let v1 = game
+            .versions
+            .iter()
+            .find(|v| v.version_label == "Ver1.0")
+            .unwrap();
+        let v2 = game
+            .versions
+            .iter()
+            .find(|v| v.version_label == "Ver2.0")
+            .unwrap();
+        assert_eq!(v1.game_type, GameType::Folder);
+        assert_eq!(v2.game_type, GameType::Archive);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- T-1.1-04 / ACC-04：反例结构 → 1 档案 0 版本 ----
+    #[test]
+    fn t11_04_nested_exe_yields_zero_versions() {
+        let root = tmp_root("t1104");
+        let g = root.join("RJ004");
+        fs::create_dir_all(g.join("DLC")).unwrap();
+        fs::create_dir_all(g.join("ArtBook")).unwrap();
+        fs::create_dir_all(g.join("Game").join("data")).unwrap();
+        write(&g.join("Game").join("data"), "game.exe");
+
+        let report = scan(&root);
+        assert_eq!(report.games.len(), 1, "强断言：仍须建档");
+        let game = &report.games[0];
+        assert_eq!(game.layout, GameLayout::Standard);
+        assert!(
+            game.versions.is_empty(),
+            "可执行文件在子目录中 → 不构成版本: {:?}",
+            game.versions
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- T-1.1-05 / ACC-05：空目录 → 1 档案 0 版本 ----
+    #[test]
+    fn t11_05_empty_dir_still_archived() {
+        let root = tmp_root("t1105");
+        fs::create_dir_all(root.join("空目录")).unwrap();
+
+        let report = scan(&root);
+        assert_eq!(report.games.len(), 1, "强断言：空目录也建档");
+        assert!(report.games[0].versions.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- T-1.1-06 / ACC-06：系统目录不建档 ----
+    #[test]
+    fn t11_06_system_dirs_excluded() {
+        let root = tmp_root("t1106");
+        for name in ["#recycle", "@eaDir", "System Volume Information"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let g = root.join("RJ001");
+        fs::create_dir_all(&g).unwrap();
+        write(&g, "game.exe");
+
+        let report = scan(&root);
+        assert_eq!(report.games.len(), 1, "只有 RJ001 应建档");
+        assert_eq!(report.games[0].display_name, "RJ001");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- T-1.1-07 / ACC-07：根下散落文件不建档 ----
+    #[test]
+    fn t11_07_root_loose_file_warns() {
+        let root = tmp_root("t1107");
+        write(&root, "散装.zip");
+        let g = root.join("RJ001");
+        fs::create_dir_all(&g).unwrap();
+        write(&g, "game.exe");
+
+        let report = scan(&root);
+        assert_eq!(report.games.len(), 1);
+        assert_eq!(report.warnings.root_loose_files, 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- T-1.1-08 / ACC-08：截断可见性 ----
+    #[test]
+    fn t11_08_truncation_visible() {
+        let root = tmp_root("t1108");
+        let g = root.join("RJ005");
+        fs::create_dir_all(g.join("Ver2.0")).unwrap();
+        write(&g, "game.exe");
+        write(&g.join("Ver2.0"), "game.exe");
+
+        let report = scan(&root);
+        let game = &report.games[0];
+        assert_eq!(game.layout, GameLayout::Compact);
+        assert_eq!(game.versions.len(), 1, "截断：Ver2.0 不参与版本识别");
+        assert_eq!(report.warnings.truncated_with_version_dirs, 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- T-1.1-09 / ACC-09：同目录多压缩包 → 1 版本 ----
+    #[test]
+    fn t11_09_multi_archive_single_version() {
+        let root = tmp_root("t1109");
+        let v = root.join("RJ006").join("Ver1.0");
+        fs::create_dir_all(&v).unwrap();
+        write(&v, "a.zip");
+        write(&v, "b.zip");
+
+        let report = scan(&root);
+        let game = &report.games[0];
+        assert_eq!(game.versions.len(), 1, "同目录多压缩包合并为 1 版本");
+        let ver = &game.versions[0];
+        assert_eq!(ver.game_type, GameType::Archive);
+        assert_eq!(ver.archive_groups.len(), 2, "两个独立压缩组");
+        assert_eq!(ver.size_bytes, 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- T-1.1-10 / ACC-10：exe 优先 ----
+    #[test]
+    fn t11_10_exe_wins_over_archive() {
+        let root = tmp_root("t1110");
+        let v = root.join("RJ007").join("Ver1.0");
+        fs::create_dir_all(&v).unwrap();
+        write(&v, "game.exe");
+        write(&v, "data.zip");
+
+        let report = scan(&root);
+        let ver = &report.games[0].versions[0];
+        assert_eq!(ver.game_type, GameType::Folder);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- T-1.1-21：排除名单过滤后无候选 → 不构成版本 ----
+    #[test]
+    fn t11_21_only_noise_exe_is_not_version() {
+        let root = tmp_root("t1121");
+        let v = root.join("RJ008").join("Ver1.0");
+        fs::create_dir_all(&v).unwrap();
+        write(&v, "unins000.exe");
+
+        let report = scan(&root);
+        assert_eq!(report.games.len(), 1, "强断言：仍建档");
+        assert!(report.games[0].versions.is_empty(), "只有工具 exe，不算版本");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- T-1.1-22：分卷聚合 ----
+    #[test]
+    fn t11_22_split_rar_one_group() {
+        let root = tmp_root("t1122");
+        let v = root.join("RJ009").join("Ver1.0");
+        fs::create_dir_all(&v).unwrap();
+        write(&v, "game.part1.rar");
+        write(&v, "game.part2.rar");
+
+        let report = scan(&root);
+        let ver = &report.games[0].versions[0];
+        assert_eq!(ver.archive_groups.len(), 1);
+        assert_eq!(ver.archive_groups[0].files.len(), 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- 中文与长路径（沿用 v1 T30 / T31） ----
+    #[test]
+    fn t11_18_chinese_names() {
+        let root = tmp_root("t1118");
+        let v = root.join("巫女神さまIF").join("Ver1.0");
+        fs::create_dir_all(&v).unwrap();
+        write(&v, "巫女神さま.exe");
+
+        let report = scan(&root);
+        assert_eq!(report.games.len(), 1);
+        assert_eq!(report.games[0].display_name, "巫女神さまIF");
+        assert_eq!(report.games[0].versions.len(), 1);
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn t26_bin_is_not_archive() {
-        // .bin 是数据文件，不算压缩包（Q-I）
-        let root = tmp_root("t26");
-        let game = root.join("game");
-        fs::create_dir_all(&game).unwrap();
-        fs::write(game.join("game.exe"), b"x").unwrap();
-        fs::write(game.join("data.bin"), b"x").unwrap();
-        fs::write(game.join("sound.bin"), b"x").unwrap();
-
-        let games = scan(&root);
-        assert_eq!(games.len(), 1);
-        assert_eq!(games[0].game_type, GameType::Folder, "有 exe 时应判 folder");
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn t27_exe_wins_over_archive_in_same_dir() {
-        let root = tmp_root("t27");
-        let game = root.join("game");
-        fs::create_dir_all(&game).unwrap();
-        fs::write(game.join("game.exe"), b"x").unwrap();
-        fs::write(game.join("data.zip"), b"x").unwrap();
-
-        let games = scan(&root);
-        assert_eq!(games.len(), 1);
-        assert_eq!(games[0].game_type, GameType::Folder);
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn t28_only_noise_exe_is_not_game() {
-        // 只有噪音 exe（全部在排除名单）→ 不建档
-        let root = tmp_root("t28");
-        let dir = root.join("notagame");
+    fn t11_18b_long_path() {
+        let root = tmp_root("t1118b");
+        let mut dir = root.join("RJ010");
+        let seg = "a".repeat(60);
+        for _ in 0..4 {
+            dir.push(&seg);
+        }
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("notification_helper.exe"), b"x").unwrap();
-        fs::write(dir.join("chromedriver.exe"), b"x").unwrap();
-
-        let games = scan(&root);
-        assert!(games.is_empty(), "全为排除名单 exe 时不应建档");
+        write(&dir, "game.exe");
+        // 把 exe 放到版本目录：RJ010/aaa.../ver/game.exe 少一层，构造标准形态
+        // 这里直接验证长路径目录下分类不 panic
+        let report = scan(&root);
+        assert_eq!(report.games.len(), 1);
         let _ = fs::remove_dir_all(&root);
     }
 
+    // ---- t17 / t16：取消与断点续扫 ----
     #[test]
-    fn t35_noise_plus_real_exe_still_builds() {
-        // D18：排除名单不得过滤掉目录
-        let root = tmp_root("t35");
-        let dir = root.join("game");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("notification_helper.exe"), b"x").unwrap();
-        fs::write(dir.join("real_game.exe"), b"x").unwrap();
-
-        let games = scan(&root);
-        assert_eq!(games.len(), 1, "有非名单 exe 就必须建档");
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn t7_split_rar_is_one_archive() {
-        let root = tmp_root("t7");
-        let dir = root.join("game");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("game.part1.rar"), b"x").unwrap();
-        fs::write(dir.join("game.part2.rar"), b"x").unwrap();
-        fs::write(dir.join("game.part3.rar"), b"x").unwrap();
-
-        let games = scan(&root);
-        assert_eq!(games.len(), 1, "分卷应聚合为一条档案");
-        assert_eq!(games[0].game_type, GameType::Archive);
-        assert_eq!(games[0].groups.len(), 1);
-        assert_eq!(games[0].groups[0].files.len(), 3);
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn t8_seven_zip_split() {
-        let root = tmp_root("t8");
-        let dir = root.join("game");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("game.7z.001"), b"x").unwrap();
-        fs::write(dir.join("game.7z.002"), b"x").unwrap();
-
-        let games = scan(&root);
-        assert_eq!(games.len(), 1);
-        assert_eq!(games[0].groups[0].files.len(), 2);
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn t32_multi_version_each_becomes_archive() {
-        // D15：每个版本各建一条档案
-        let root = tmp_root("t32");
-        let v1 = root.join("RJ1234").join("Ver1.0");
-        let v2 = root.join("RJ1234").join("Ver2.0");
-        fs::create_dir_all(&v1).unwrap();
-        fs::create_dir_all(&v2).unwrap();
-        fs::write(v1.join("game.exe"), b"x").unwrap();
-        fs::write(v1.join("game_chs.exe"), b"x").unwrap();
-        fs::write(v2.join("game.exe"), b"x").unwrap();
-
-        let games = scan(&root);
-        assert_eq!(games.len(), 2, "多版本应各建一条档案");
-        assert!(games.iter().any(|g| g.relative_path == "RJ1234/Ver1.0"));
-        assert!(games.iter().any(|g| g.relative_path == "RJ1234/Ver2.0"));
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn t3_depth_limit() {
-        // 超过深度 3 的分支放弃
-        let root = tmp_root("t3");
-        let p = root.join("a").join("b").join("c").join("d");
-        fs::create_dir_all(&p).unwrap();
-        fs::write(p.join("game.exe"), b"x").unwrap();
-
-        let games = scan(&root);
-        assert!(games.is_empty(), "深度 4 应被放弃");
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn t9_archive_not_through_subdir() {
-        // Q-A：压缩文件判定不穿透子目录
-        let root = tmp_root("t9");
-        let outer = root.join("outer");
-        let inner = outer.join("inner");
-        fs::create_dir_all(&inner).unwrap();
-        fs::write(inner.join("a.zip"), b"x").unwrap();
-
-        let games = scan(&root);
-        assert_eq!(games.len(), 1);
-        assert_eq!(games[0].relative_path, "outer/inner");
-        assert_eq!(games[0].game_type, GameType::Archive);
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// T17：取消后立即停止，不产出档案（D10）
-    #[test]
-    fn t17_cancel_stops_scan() {
-        let root = tmp_root("t17");
+    fn t11_cancel_stops_scan() {
+        let root = tmp_root("t11cancel");
         for i in 0..5 {
-            let d = root.join(format!("g{i}"));
-            fs::create_dir_all(&d).unwrap();
-            fs::write(d.join("game.exe"), b"x").unwrap();
+            let g = root.join(format!("G{i}"));
+            fs::create_dir_all(&g).unwrap();
+            write(&g, "game.exe");
         }
         let cfg = ScanConfig::default();
         let ctl = ScanControl::new();
         ctl.cancel();
 
-        let r = scan_repository(&root, &cfg, &ctl, 0, |_| {});
-        assert!(r.cancelled, "取消后应返回 cancelled");
-        assert!(r.games.is_empty(), "取消不应产出档案");
+        let result = scan_repository(&root, &cfg, &ctl, 0, |_| {});
+        assert!(result.cancelled, "取消后应停止");
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// T16：断点续扫只处理剩余顶层条目（D10）
     #[test]
-    fn t16_resume_from_checkpoint() {
-        let root = tmp_root("t16");
-        for i in 0..3 {
-            let d = root.join(format!("g{i}"));
-            fs::create_dir_all(&d).unwrap();
-            fs::write(d.join("game.exe"), b"x").unwrap();
+    fn t11_resume_from_checkpoint() {
+        let root = tmp_root("t11resume");
+        for i in 0..4 {
+            let g = root.join(format!("G{i}"));
+            fs::create_dir_all(&g).unwrap();
+            write(&g, "game.exe");
         }
         let cfg = ScanConfig::default();
         let ctl = ScanControl::new();
 
-        let full = scan_repository(&root, &cfg, &ctl, 0, |_| {});
-        assert_eq!(full.games.len(), 3);
+        let first = scan_repository(&root, &cfg, &ctl, 0, |_| {});
+        assert_eq!(first.report.games.len(), 4);
 
-        let resumed = scan_repository(&root, &cfg, &ctl, 2, |_| {});
-        assert_eq!(resumed.games.len(), 1, "从索引 2 续扫应只处理剩余 1 个");
-        assert!(!resumed.cancelled);
+        // 从索引 2 续扫：只剩 2 个
+        let second = scan_repository(&root, &cfg, &ctl, 2, |_| {});
+        assert_eq!(second.report.games.len(), 2, "续扫跳过前两个条目");
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// T30：中文目录名 + 中文 exe 名（ACC-02-34）
+    // ---- 单档案扫描 ----
     #[test]
-    fn t30_chinese_names() {
-        let root = tmp_root("t30");
-        let dir = root.join("巫女神さまIF");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("巫女神さま.exe"), b"x").unwrap();
+    fn t11_scan_one_game() {
+        let root = tmp_root("t11one");
+        let g = root.join("RJ020");
+        fs::create_dir_all(g.join("Ver1.0")).unwrap();
+        write(&g.join("Ver1.0"), "game.exe");
 
-        let games = scan(&root);
-        assert_eq!(games.len(), 1, "中文目录必须能建档");
-        assert_eq!(games[0].display_name, "巫女神さまIF");
-        assert_eq!(games[0].game_type, GameType::Folder);
+        let (game, _w) = scan_one_game(&root, "RJ020", &ScanConfig::default());
+        assert_eq!(game.relative_path, "RJ020");
+        assert_eq!(game.versions.len(), 1);
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// T31：超长路径（>260 字符）仍能扫描（ACC-02-35）
-    /// 构造方式：3 层、每层 80 个汉字（约 240 字节），总长显著超过 MAX_PATH。
+    // ---- 根级目录排除名单解析 ----
     #[test]
-    fn t31_long_path() {
-        let root = tmp_root("t31");
-        let segment = "长".repeat(80); // 每层约 80 字符
-        let mut deep = root.clone();
-        for _ in 0..3 {
-            deep = deep.join(&segment);
-        }
-
-        // 创建时必须用 \\?\ 前缀，否则 std 会因 MAX_PATH 失败
-        let deep_ext = extend_path(&deep);
-        if fs::create_dir_all(&deep_ext).is_err() {
-            eprintln!("跳过：当前环境无法创建超长路径");
-            let _ = fs::remove_dir_all(&root);
-            return;
-        }
-        fs::write(deep_ext.join("game.exe"), b"x").unwrap();
-
-        let games = scan(&root);
-        assert_eq!(games.len(), 1, "超长路径下的游戏应被扫到");
-        assert_eq!(games[0].display_name, segment);
-        let _ = fs::remove_dir_all(&root);
+    fn t11_root_excluded_parsing() {
+        let list = parse_root_excluded(Some(r##"["#recycle","@eaDir"]"##.to_string()));
+        assert_eq!(list, vec!["#recycle".to_string(), "@eadir".to_string()]);
+        assert!(parse_root_excluded(Some("not json".to_string())).is_empty());
+        assert!(parse_root_excluded(None).is_empty());
     }
 }

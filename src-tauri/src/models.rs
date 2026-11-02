@@ -1,12 +1,38 @@
 //! 数据模型：与前端交互的 DTO + 扫描器内部结构。
-//! 依据：DSPlans/MVPv1扫描器规格.md §5
-
-// 部分结构/方法为 v2 预留（如 ScanOutcome、ScanDelta），v1 尚未全部使用
-#![allow(dead_code)]
+//! 依据：DSPlans/MVPv1.1技术规格.md §3（数据结构）/ §5（表结构）
 
 use serde::{Deserialize, Serialize};
 
-/// 游戏类型（D5a）。v1 不展示，但必须落库——v2 搬运行为依赖它。
+// ---------------------------------------------------------------------------
+// 枚举
+// ---------------------------------------------------------------------------
+
+/// 游戏形态（v1.1 仓库口径）：紧凑 = 游戏标识层自身含可执行文件或压缩包；标准 = 由版本层组织
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GameLayout {
+    Compact,
+    Standard,
+}
+
+impl GameLayout {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GameLayout::Compact => "compact",
+            GameLayout::Standard => "standard",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "compact" => Some(GameLayout::Compact),
+            "standard" => Some(GameLayout::Standard),
+            _ => None,
+        }
+    }
+}
+
+/// 版本类型（D5a / Q-G：exe 优先于压缩包）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GameType {
@@ -31,7 +57,34 @@ impl GameType {
     }
 }
 
-/// 档案状态（D11）。missing = 上次扫到、本次未扫到，UI 灰显保留。
+/// 版本来源（v1.1 §2「版本管理与可执行文件配置」）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionSource {
+    /// 扫描发现
+    Scan,
+    /// 用户手动新建
+    Manual,
+}
+
+impl VersionSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VersionSource::Scan => "scan",
+            VersionSource::Manual => "manual",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "scan" => Some(VersionSource::Scan),
+            "manual" => Some(VersionSource::Manual),
+            _ => None,
+        }
+    }
+}
+
+/// 档案 / 版本状态（D11）：missing = 上次扫到、本次未扫到，UI 灰显保留。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GameStatus {
@@ -89,7 +142,7 @@ impl LocatorKind {
 // 扫描器内部结构
 // ---------------------------------------------------------------------------
 
-/// 压缩包组（D6：分卷聚合的单元）
+/// 压缩包组（分卷聚合的单元；v1.1 只作为版本内部结构，不再产生独立档案）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveGroup {
     /// 组键（去掉分卷后缀的主体名）
@@ -104,28 +157,65 @@ pub struct ArchiveFile {
     pub part_index: Option<u32>,
 }
 
-/// 扫描判定出的一个游戏单元
-#[derive(Debug, Clone)]
-pub struct GameEntry {
-    /// 相对仓库根的路径（匹配键的一半）
+/// 版本内的候选可执行文件（未命中排除名单）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExeCandidate {
+    /// 相对仓库根（可能是紧凑型的游戏目录，也可能是版本目录）
     pub relative_path: String,
-    /// 压缩包组键（Q-B 匹配键的另一半；folder 型为空串）
-    pub group_key: String,
-    pub game_type: GameType,
-    /// 初始显示名 = 目录名 / 压缩包组主名（用户可改）
-    pub display_name: String,
+    pub file_name: String,
     pub size_bytes: u64,
-    pub groups: Vec<ArchiveGroup>,
 }
 
-/// 判定结果
+/// 扫描判定出的一个版本（= 版本标识层；紧凑型 = 游戏标识层自身）
 #[derive(Debug, Clone)]
-pub enum ScanOutcome {
-    Game(GameEntry),
-    /// 容器目录：继续下探
-    Container,
-    /// 超过深度上限或不可判定：放弃该分支
-    Skip,
+pub struct VersionEntry {
+    /// 相对仓库根
+    pub relative_path: String,
+    /// 目录原名（用户可改显示名，此为默认值）
+    pub version_label: String,
+    pub game_type: GameType,
+    /// 本层文件大小之和（不含子目录）
+    pub size_bytes: u64,
+    pub executables: Vec<ExeCandidate>,
+    pub archive_groups: Vec<ArchiveGroup>,
+}
+
+/// 扫描判定出的一个游戏档案（= 游戏标识层，一层一条）
+#[derive(Debug, Clone)]
+pub struct GameEntry {
+    /// 游戏标识层，相对仓库根
+    pub relative_path: String,
+    pub layout: GameLayout,
+    /// 初始显示名 = 目录名（用户可改）
+    pub display_name: String,
+    /// = 各版本 size 之和
+    pub size_bytes: u64,
+    /// 可为空（反例结构：版本层内探测不到可执行文件 / 压缩包）
+    pub versions: Vec<VersionEntry>,
+}
+
+/// 扫描可见性告警（v1.1 新增）
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ScanWarnings {
+    /// 仓库根下的散落文件数（不建档）
+    pub root_loose_files: u32,
+    /// 因自身含 exe / 压缩包而被截断、且其子目录也含 exe / 压缩包的目录数
+    pub truncated_with_version_dirs: u32,
+    /// 目录枚举失败数（权限 / 长路径 / 网络失败）
+    pub enum_failed: u32,
+}
+
+impl ScanWarnings {
+    pub fn total(&self) -> u32 {
+        self.root_loose_files + self.truncated_with_version_dirs + self.enum_failed
+    }
+}
+
+/// 一次扫描的完整结果
+#[derive(Debug, Clone, Default)]
+pub struct ScanReport {
+    pub games: Vec<GameEntry>,
+    pub warnings: ScanWarnings,
 }
 
 /// 扫描相位
@@ -138,7 +228,24 @@ pub enum ScanPhase {
     Finishing,
 }
 
-/// 推给前端的进度（D8：分母 = 顶层条目数）
+/// 扫描范围（v1.1 新增：全量 / 单档案）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanScope {
+    Full,
+    Single,
+}
+
+impl ScanScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScanScope::Full => "full",
+            ScanScope::Single => "single",
+        }
+    }
+}
+
+/// 推给前端的进度（D8：分母 = 顶层条目数；单档案重扫 total 恒为 1）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanProgress {
     pub job_id: u64,
@@ -149,14 +256,7 @@ pub struct ScanProgress {
     pub current: Option<String>,
     pub phase: ScanPhase,
     pub warnings: u32,
-}
-
-/// 重扫差异（§8）
-#[derive(Debug, Default)]
-pub struct ScanDelta {
-    pub added: Vec<GameEntry>,
-    pub updated: Vec<(i64, GameEntry)>,
-    pub missing: Vec<i64>,
+    pub scope: ScanScope,
 }
 
 // ---------------------------------------------------------------------------
@@ -203,27 +303,84 @@ pub struct NewLocator {
     pub path_template: String,
 }
 
+/// 档案行（= 游戏标识层，1 游戏 1 行）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameRow {
     pub id: i64,
     pub repository_id: i64,
     pub relative_path: String,
-    pub group_key: String,
-    pub game_type: String,
+    pub layout: String,
     pub display_name: String,
     pub game_code: Option<String>,
     pub cover_path: Option<String>,
     pub size_bytes: i64,
     pub status: String,
+    /// 版本数量
+    pub version_count: i64,
+    /// 启动按钮当前选中版本
+    pub selected_version_id: Option<i64>,
+    /// 选中版本的显示名（便于前端直接展示按钮文案）
+    pub selected_version_label: Option<String>,
     pub updated_at: String,
 }
 
+/// 版本内的可执行文件行
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutableRow {
+    pub id: i64,
+    /// 相对仓库根
+    pub relative_path: String,
+    pub file_name: String,
+    pub size_bytes: i64,
+    /// 该版本的启动项
+    pub is_selected: bool,
+    /// scan / manual
+    pub source: String,
+    /// 上次重扫已找不到该文件
+    pub invalid: bool,
+}
+
+/// 版本行
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GameVersionRow {
+    pub id: i64,
+    pub game_id: i64,
+    /// 相对仓库根
+    pub relative_path: String,
+    /// 目录原名（扫描刷新）
+    pub version_label: String,
+    /// 用户可改显示名，默认 = version_label
+    pub display_name: String,
+    pub note: Option<String>,
+    pub game_type: String,
+    pub size_bytes: i64,
+    /// scan / manual
+    pub source: String,
+    pub status: String,
+    pub executables: Vec<ExecutableRow>,
+    pub updated_at: String,
+}
+
+/// 档案详情（含版本列表）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameDetail {
     #[serde(flatten)]
     pub row: GameRow,
+    pub versions: Vec<GameVersionRow>,
     /// 拼接后的绝对路径（详情页"本机详情"）
     pub absolute_path: Option<String>,
+}
+
+/// 黑名单记录
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlocklistRow {
+    pub id: i64,
+    pub repository_id: i64,
+    /// game / version
+    pub kind: String,
+    /// 档案：游戏标识层；版本：<游戏路径>/<版本目录名>
+    pub relative_path: String,
+    pub created_at: String,
 }
 
 /// 扫描结束摘要
@@ -236,4 +393,9 @@ pub struct ScanSummary {
     pub updated: u32,
     pub missing: u32,
     pub warning_count: u32,
+    /// 可见性明细（v1.1）
+    pub root_loose_files: u32,
+    pub truncated_with_version_dirs: u32,
+    pub enum_failed: u32,
+    pub scope: ScanScope,
 }

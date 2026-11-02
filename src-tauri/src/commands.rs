@@ -1,5 +1,5 @@
-//! Tauri 命令层：仓库配置、档案读写、扫描控制。
-//! 依据：DSPlans/MVPv1扫描器规格.md §7（IPC 协议）、§8（幂等重扫）、§10（错误处理）
+//! Tauri 命令层：仓库配置、档案 / 版本读写、扫描控制、黑名单。
+//! 依据：DSPlans/MVPv1.1技术规格.md §7（行为细则）、§8（IPC 协议）
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -12,8 +12,9 @@ use crate::db::Db;
 use crate::error::{AppError, AppResult};
 use crate::locator;
 use crate::models::{
-    GameDetail, GameRow, LocatorKind, NewRepository, RepositoryLocator, RepositoryRow, ScanPhase,
-    ScanProgress, ScanSummary,
+    BlocklistRow, ExecutableRow, ExeCandidate, GameDetail, GameRow, GameVersionRow, LocatorKind,
+    NewRepository, RepositoryLocator, RepositoryRow, ScanPhase, ScanProgress, ScanScope,
+    ScanSummary,
 };
 use crate::scanner::{self, ScanConfig, ScanControl};
 use crate::state::{ActiveScan, AppState, ScanSlot};
@@ -50,16 +51,12 @@ pub fn list_repositories(state: State<'_, AppState>) -> AppResult<Vec<Repository
         let mut out = Vec::with_capacity(rows.len());
         for mut row in rows {
             row.locators = load_locators(conn, row.id)?;
-            // 不在此处做网络探测（会拖慢列表）；active_locator 对应的模板作为乐观路径
-            row.resolved_path = row
-                .active_locator
-                .as_ref()
-                .and_then(|kind| {
-                    row.locators
-                        .iter()
-                        .find(|l| &l.kind == kind)
-                        .map(|l| l.path_template.clone())
-                });
+            row.resolved_path = row.active_locator.as_ref().and_then(|kind| {
+                row.locators
+                    .iter()
+                    .find(|l| &l.kind == kind)
+                    .map(|l| l.path_template.clone())
+            });
             out.push(row);
         }
         Ok(out)
@@ -99,18 +96,7 @@ pub fn check_repository(state: State<'_, AppState>, repository_id: i64) -> AppRe
 #[tauri::command]
 pub fn add_repository(state: State<'_, AppState>, payload: NewRepository) -> AppResult<i64> {
     validate_new_repository(&payload)?;
-    let name = payload
-        .name
-        .clone()
-        .filter(|n| !n.trim().is_empty())
-        .or_else(|| {
-            payload
-                .locators
-                .iter()
-                .find(|l| l.kind == "drive")
-                .map(|l| l.path_template.clone())
-        })
-        .unwrap_or_else(|| payload.relative_root.clone());
+    let name = repository_display_name(&payload);
 
     state.db.with_mut(|conn| {
         let tx = conn.transaction()?;
@@ -144,21 +130,14 @@ pub fn update_repository(
     validate_new_repository(&payload)?;
     state.db.with_mut(|conn| {
         let tx = conn.transaction()?;
-        let name = payload
-            .name
-            .clone()
-            .filter(|n| !n.trim().is_empty())
-            .or_else(|| {
-                payload
-                    .locators
-                    .iter()
-                    .find(|l| l.kind == "drive")
-                    .map(|l| l.path_template.clone())
-            })
-            .unwrap_or_else(|| payload.relative_root.clone());
         let affected = tx.execute(
             "UPDATE repositories SET name=?1, share_name=?2, relative_root=?3 WHERE id=?4",
-            params![name, payload.share_name, payload.relative_root, repository_id],
+            params![
+                repository_display_name(&payload),
+                payload.share_name,
+                payload.relative_root,
+                repository_id
+            ],
         )?;
         if affected == 0 {
             return Err(AppError::RepositoryNotFound(repository_id));
@@ -202,18 +181,24 @@ pub fn delete_repository(state: State<'_, AppState>, repository_id: i64) -> AppR
 // 档案
 // ---------------------------------------------------------------------------
 
+const GAME_ROW_SQL: &str = "SELECT g.id, g.repository_id, g.relative_path, g.layout, g.display_name,
+        g.game_code, g.cover_path, g.size_bytes, g.status, g.selected_version_id, g.updated_at,
+        (SELECT COUNT(*) FROM game_versions v WHERE v.game_id = g.id),
+        (SELECT v.display_name FROM game_versions v WHERE v.id = g.selected_version_id)
+   FROM games g";
+
 #[tauri::command]
 pub fn list_games(
     state: State<'_, AppState>,
     repository_id: Option<i64>,
 ) -> AppResult<Vec<GameRow>> {
     state.db.with(|conn| {
-        let sql = "SELECT id, repository_id, relative_path, group_key, game_type, display_name,
-                          game_code, cover_path, size_bytes, status, updated_at
-                   FROM games
-                   WHERE (?1 IS NULL OR repository_id = ?1)
-                   ORDER BY display_name COLLATE NOCASE ASC";
-        let mut stmt = conn.prepare(sql)?;
+        let sql = format!(
+            "{GAME_ROW_SQL}
+             WHERE (?1 IS NULL OR g.repository_id = ?1)
+             ORDER BY g.display_name COLLATE NOCASE ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params![repository_id], map_game_row)?
             .filter_map(|r| r.ok())
@@ -225,19 +210,18 @@ pub fn list_games(
 #[tauri::command]
 pub fn get_game(state: State<'_, AppState>, game_id: i64) -> AppResult<GameDetail> {
     state.db.with(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id, repository_id, relative_path, group_key, game_type, display_name,
-                    game_code, cover_path, size_bytes, status, updated_at
-             FROM games WHERE id=?1",
-        )?;
-        let row = stmt
+        let sql = format!("{GAME_ROW_SQL} WHERE g.id=?1");
+        let row = conn
+            .prepare(&sql)?
             .query_row(params![game_id], map_game_row)
             .optional()?
             .ok_or(AppError::GameNotFound(game_id))?;
 
+        let versions = load_versions(conn, game_id)?;
         let abs = absolute_path(conn, &row)?;
         Ok(GameDetail {
             row,
+            versions,
             absolute_path: abs,
         })
     })
@@ -269,6 +253,421 @@ pub fn update_game(
     })
 }
 
+#[tauri::command]
+pub fn update_version(
+    state: State<'_, AppState>,
+    version_id: i64,
+    display_name: String,
+    note: Option<String>,
+) -> AppResult<()> {
+    let name = display_name.trim().to_string();
+    if name.is_empty() {
+        return Err(AppError::InvalidInput("版本名称不能为空".into()));
+    }
+    state.db.with(|conn| {
+        let affected = conn.execute(
+            "UPDATE game_versions SET display_name=?1, note=?2, updated_at=?3 WHERE id=?4",
+            params![
+                name,
+                note.filter(|s| !s.trim().is_empty()),
+                Db::now(),
+                version_id
+            ],
+        )?;
+        if affected == 0 {
+            return Err(AppError::VersionNotFound(version_id));
+        }
+        Ok(())
+    })
+}
+
+#[tauri::command]
+pub fn set_selected_version(
+    state: State<'_, AppState>,
+    game_id: i64,
+    version_id: i64,
+) -> AppResult<()> {
+    state.db.with(|conn| {
+        let belongs: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM game_versions WHERE id=?1 AND game_id=?2",
+                params![version_id, game_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if belongs.is_none() {
+            return Err(AppError::VersionNotFound(version_id));
+        }
+        conn.execute(
+            "UPDATE games SET selected_version_id=?1, updated_at=?2 WHERE id=?3",
+            params![version_id, Db::now(), game_id],
+        )?;
+        Ok(())
+    })
+}
+
+#[tauri::command]
+pub fn set_selected_executable(
+    state: State<'_, AppState>,
+    version_id: i64,
+    executable_id: i64,
+) -> AppResult<()> {
+    state.db.with_mut(|conn| {
+        let tx = conn.transaction()?;
+        let game_id: Option<i64> = tx
+            .query_row(
+                "SELECT game_id FROM game_versions WHERE id=?1",
+                params![version_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(game_id) = game_id else {
+            return Err(AppError::VersionNotFound(version_id));
+        };
+        let exists: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM game_version_executables WHERE id=?1 AND version_id=?2",
+                params![executable_id, version_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(AppError::ExecutableNotFound(executable_id));
+        }
+        let now = Db::now();
+        tx.execute(
+            "UPDATE game_version_executables SET is_selected=0 WHERE version_id=?1",
+            params![version_id],
+        )?;
+        tx.execute(
+            "UPDATE game_version_executables SET is_selected=1, invalid=0 WHERE id=?1",
+            params![executable_id],
+        )?;
+        // 设置启动项同时把该版本设为当前版本
+        tx.execute(
+            "UPDATE games SET selected_version_id=?1, updated_at=?2 WHERE id=?3",
+            params![version_id, now, game_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 版本（手动）
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn list_executable_candidates(
+    state: State<'_, AppState>,
+    repository_id: i64,
+    relative_path: String,
+    max_depth: Option<u32>,
+) -> AppResult<Vec<ExeCandidate>> {
+    let root = resolve_repository(&state.db, repository_id)?;
+    let rel = normalize_rel_arg(&relative_path);
+    let base = join_rel(Path::new(&root), &rel);
+    if !base.is_dir() {
+        return Err(AppError::InvalidInput(format!("目录不存在：{rel}")));
+    }
+    let mut out = Vec::new();
+    collect_exes(&base, &rel, 0, max_depth.unwrap_or(2), &mut out);
+    out.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn create_manual_version(
+    state: State<'_, AppState>,
+    game_id: i64,
+    relative_path: String,
+    executable_relative_path: String,
+    display_name: Option<String>,
+) -> AppResult<i64> {
+    let rel = normalize_rel_arg(&relative_path);
+    let exe_rel = normalize_rel_arg(&executable_relative_path);
+
+    let (repository_id, game_rel): (i64, String) = state.db.with(|conn| {
+        conn.query_row(
+            "SELECT repository_id, relative_path FROM games WHERE id=?1",
+            params![game_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or(AppError::GameNotFound(game_id))
+    })?;
+
+    // 目录必须是该游戏目录自身或其子目录
+    if rel != game_rel && !rel.starts_with(&format!("{game_rel}/")) {
+        return Err(AppError::InvalidInput(
+            "版本目录必须位于该游戏目录之下".into(),
+        ));
+    }
+    // 启动项必须位于该版本目录之下（允许更深层，用于兜底不规范结构）
+    if !exe_rel.starts_with(&format!("{rel}/")) {
+        return Err(AppError::InvalidInput(
+            "可执行文件必须位于该版本目录之下".into(),
+        ));
+    }
+
+    let root = resolve_repository(&state.db, repository_id)?;
+    let dir = join_rel(Path::new(&root), &rel);
+    if !dir.is_dir() {
+        return Err(AppError::InvalidInput(format!("目录不存在：{rel}")));
+    }
+    let exe_path = join_rel(Path::new(&root), &exe_rel);
+    if !exe_path.is_file() {
+        return Err(AppError::InvalidInput(format!("可执行文件不存在：{exe_rel}")));
+    }
+
+    let label = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+    let shown = display_name
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| label.clone());
+    let file_name = exe_rel.rsplit('/').next().unwrap_or(&exe_rel).to_string();
+    let size = std::fs::metadata(&exe_path).map(|m| m.len()).unwrap_or(0);
+
+    state.db.with_mut(|conn| {
+        let tx = conn.transaction()?;
+        let now = Db::now();
+        // 同路径的已存在版本直接复用（避免重复）
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM game_versions WHERE game_id=?1 AND relative_path=?2",
+                params![game_id, rel],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        let version_id = match existing {
+            Some(id) => {
+                tx.execute(
+                    "UPDATE game_versions SET source='manual', status='ok', updated_at=?1 WHERE id=?2",
+                    params![now, id],
+                )?;
+                id
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO game_versions(game_id, relative_path, version_label, display_name,
+                        note, game_type, size_bytes, source, status, created_at, updated_at)
+                     VALUES(?1, ?2, ?3, ?4, NULL, 'folder', 0, 'manual', 'ok', ?5, ?5)",
+                    params![game_id, rel, label, shown, now],
+                )?;
+                tx.last_insert_rowid()
+            }
+        };
+
+        tx.execute(
+            "INSERT OR REPLACE INTO game_version_executables(version_id, relative_path, file_name,
+                size_bytes, is_selected, source, invalid, created_at)
+             VALUES(?1, ?2, ?3, ?4, 0, 'manual', 0, ?5)",
+            params![version_id, exe_rel, file_name, size as i64, now],
+        )?;
+        tx.execute(
+            "UPDATE game_version_executables SET is_selected=0 WHERE version_id=?1",
+            params![version_id],
+        )?;
+        tx.execute(
+            "UPDATE game_version_executables SET is_selected=1 WHERE version_id=?1 AND relative_path=?2",
+            params![version_id, exe_rel],
+        )?;
+        tx.execute(
+            "UPDATE games SET selected_version_id=?1, updated_at=?2 WHERE id=?3",
+            params![version_id, now, game_id],
+        )?;
+        tx.commit()?;
+        Ok(version_id)
+    })
+}
+
+#[tauri::command]
+pub fn add_manual_executable(
+    state: State<'_, AppState>,
+    version_id: i64,
+    relative_path: String,
+) -> AppResult<i64> {
+    let exe_rel = normalize_rel_arg(&relative_path);
+    let (game_id, repository_id, version_rel): (i64, i64, String) = state.db.with(|conn| {
+        conn.query_row(
+            "SELECT v.game_id, g.repository_id, v.relative_path
+             FROM game_versions v JOIN games g ON g.id = v.game_id WHERE v.id=?1",
+            params![version_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+        .ok_or(AppError::VersionNotFound(version_id))
+    })?;
+    let _ = game_id;
+
+    if !exe_rel.starts_with(&format!("{version_rel}/")) {
+        return Err(AppError::InvalidInput(
+            "可执行文件必须位于该版本目录之下".into(),
+        ));
+    }
+    let root = resolve_repository(&state.db, repository_id)?;
+    let exe_path = join_rel(Path::new(&root), &exe_rel);
+    if !exe_path.is_file() {
+        return Err(AppError::InvalidInput(format!("可执行文件不存在：{exe_rel}")));
+    }
+    let file_name = exe_rel.rsplit('/').next().unwrap_or(&exe_rel).to_string();
+    let size = std::fs::metadata(&exe_path).map(|m| m.len()).unwrap_or(0);
+
+    state.db.with(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO game_version_executables(version_id, relative_path, file_name,
+                size_bytes, is_selected, source, invalid, created_at)
+             VALUES(?1, ?2, ?3, ?4, 0, 'manual', 0, ?5)",
+            params![version_id, exe_rel, file_name, size as i64, Db::now()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 删除（黑名单）
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn delete_version(state: State<'_, AppState>, version_id: i64) -> AppResult<()> {
+    state.db.with_mut(|conn| {
+        let tx = conn.transaction()?;
+        let row: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT v.game_id, v.relative_path FROM game_versions v WHERE v.id=?1",
+                params![version_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((game_id, version_rel)) = row else {
+            return Err(AppError::VersionNotFound(version_id));
+        };
+
+        let repository_id: i64 = tx.query_row(
+            "SELECT repository_id FROM games WHERE id=?1",
+            params![game_id],
+            |r| r.get(0),
+        )?;
+
+        let now = Db::now();
+        tx.execute(
+            "INSERT OR REPLACE INTO blocklist(repository_id, kind, relative_path, created_at)
+             VALUES(?1, 'version', ?2, ?3)",
+            params![repository_id, version_rel, now],
+        )?;
+        tx.execute(
+            "DELETE FROM game_versions WHERE id=?1",
+            params![version_id],
+        )?;
+
+        // 删除的是当前选中版本 → 回退到剩余第一个，无则清空
+        let selected: Option<i64> = tx
+            .query_row(
+                "SELECT selected_version_id FROM games WHERE id=?1",
+                params![game_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        if selected == Some(version_id) {
+            let next: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM game_versions WHERE game_id=?1
+                     ORDER BY version_label COLLATE NOCASE ASC LIMIT 1",
+                    params![game_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            tx.execute(
+                "UPDATE games SET selected_version_id=?1 WHERE id=?2",
+                params![next, game_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    })
+}
+
+#[tauri::command]
+pub fn delete_game(state: State<'_, AppState>, game_id: i64) -> AppResult<()> {
+    state.db.with_mut(|conn| {
+        let tx = conn.transaction()?;
+        let row: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT repository_id, relative_path FROM games WHERE id=?1",
+                params![game_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((repository_id, game_rel)) = row else {
+            return Err(AppError::GameNotFound(game_id));
+        };
+
+        let now = Db::now();
+        // 级联：档案 + 其下所有版本一并进黑名单
+        tx.execute(
+            "INSERT OR REPLACE INTO blocklist(repository_id, kind, relative_path, created_at)
+             VALUES(?1, 'game', ?2, ?3)",
+            params![repository_id, game_rel, now],
+        )?;
+        let mut stmt =
+            tx.prepare("SELECT relative_path FROM game_versions WHERE game_id=?1")?;
+        let version_rels: Vec<String> = stmt
+            .query_map(params![game_id], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+        for vrel in version_rels {
+            tx.execute(
+                "INSERT OR REPLACE INTO blocklist(repository_id, kind, relative_path, created_at)
+                 VALUES(?1, 'version', ?2, ?3)",
+                params![repository_id, vrel, now],
+            )?;
+        }
+        tx.execute("DELETE FROM games WHERE id=?1", params![game_id])?;
+        tx.commit()?;
+        Ok(())
+    })
+}
+
+#[tauri::command]
+pub fn list_blocklist(state: State<'_, AppState>) -> AppResult<Vec<BlocklistRow>> {
+    state.db.with(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, repository_id, kind, relative_path, created_at
+             FROM blocklist ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(BlocklistRow {
+                    id: r.get(0)?,
+                    repository_id: r.get(1)?,
+                    kind: r.get(2)?,
+                    relative_path: r.get(3)?,
+                    created_at: r.get(4)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    })
+}
+
+#[tauri::command]
+pub fn unblock(state: State<'_, AppState>, blocklist_id: i64) -> AppResult<()> {
+    state.db.with(|conn| {
+        let affected = conn.execute(
+            "DELETE FROM blocklist WHERE id=?1",
+            params![blocklist_id],
+        )?;
+        if affected == 0 {
+            return Err(AppError::BlocklistNotFound(blocklist_id));
+        }
+        Ok(())
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 扫描控制（D9 / D10）
 // ---------------------------------------------------------------------------
@@ -281,81 +680,63 @@ pub fn start_scan(
 ) -> AppResult<u64> {
     let db = state.db.clone();
     let slot = state.scan.clone();
-
-    let (job_id, control, last, start_index, root) = {
-        let mut guard = slot.lock().map_err(|e| AppError::Internal(e.to_string()))?;
-        if guard.active.is_some() {
-            return Err(AppError::ScanBusy);
-        }
-
-        // 解析可达路径（D16）
-        let mut repo = {
-            let conn = db
-                .conn
-                .lock()
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            let mut repo = load_repository(&conn, repository_id)?;
-            repo.locators = load_locators(&conn, repository_id)?;
-            repo
-        };
-
-        let resolved = locator::resolve(&repo.locators);
-        let Some((kind, path)) = resolved else {
-            db.with(|conn| {
-                conn.execute(
-                    "UPDATE repositories SET is_offline=1 WHERE id=?1",
-                    params![repository_id],
-                )?;
-                Ok(())
-            })?;
-            return Err(AppError::RepositoryUnreachable);
-        };
-        db.with(|conn| {
-            conn.execute(
-                "UPDATE repositories SET active_locator=?1, is_offline=0 WHERE id=?2",
-                params![kind.as_str(), repository_id],
-            )?;
-            conn.execute(
-                "UPDATE repository_locators SET last_ok_at=?1 WHERE repository_id=?2 AND kind=?3",
-                params![Db::now(), repository_id, kind.as_str()],
-            )?;
-            Ok(())
-        })?;
-        repo.active_locator = Some(kind.as_str().to_string());
-
-        // 断点（D10）
-        let start_index = load_checkpoint(&db, repository_id)?;
-
-        let job_id = guard.alloc_job_id();
-        let control = ScanControl::new();
-        let last: Arc<Mutex<Option<ScanProgress>>> = Arc::new(Mutex::new(None));
-        guard.active = Some(ActiveScan {
-            job_id,
-            repository_id,
-            control: control.clone(),
-            last: last.clone(),
-        });
-        (job_id, control, last, start_index, path)
-    };
-
-    // job 记录
-    db.with(|conn| {
-        conn.execute(
-            "INSERT INTO scan_jobs(repository_id, started_at, status) VALUES(?1, ?2, 'running')",
-            params![repository_id, Db::now()],
-        )?;
-        Ok(())
+    let root = resolve_repository(&db, repository_id)?;
+    let start_index: u32 = db.with(|conn| {
+        let v: Option<i64> = conn
+            .query_row(
+                "SELECT next_index FROM scan_checkpoints WHERE repository_id=?1",
+                params![repository_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.unwrap_or(0).max(0) as u32)
     })?;
+
+    let (job_id, control, last) = begin_job(&db, &slot, repository_id)?;
+    insert_job_row(&db, repository_id)?;
 
     let app2 = app.clone();
     let db2 = db.clone();
     let slot2 = slot.clone();
     std::thread::spawn(move || {
-        run_scan(
+        run_full_scan(
             app2, db2, slot2, repository_id, job_id, control, last, start_index, root,
         );
     });
+    Ok(job_id)
+}
 
+#[tauri::command]
+pub fn scan_single_game(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    game_id: i64,
+) -> AppResult<u64> {
+    let db = state.db.clone();
+    let slot = state.scan.clone();
+
+    let (repository_id, game_rel): (i64, String) = db.with(|conn| {
+        conn.query_row(
+            "SELECT repository_id, relative_path FROM games WHERE id=?1",
+            params![game_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or(AppError::GameNotFound(game_id))
+    })?;
+    let root = resolve_repository(&db, repository_id)?;
+
+    let (job_id, control, last) = begin_job(&db, &slot, repository_id)?;
+    insert_job_row(&db, repository_id)?;
+
+    let app2 = app.clone();
+    let db2 = db.clone();
+    let slot2 = slot.clone();
+    std::thread::spawn(move || {
+        run_single_scan(
+            app2, db2, slot2, repository_id, game_id, job_id, control, last, root, game_rel,
+        );
+    });
     Ok(job_id)
 }
 
@@ -438,6 +819,7 @@ pub fn scan_status(state: State<'_, AppState>) -> AppResult<Option<ScanProgress>
             current: None,
             phase: ScanPhase::Idle,
             warnings: 0,
+            scope: ScanScope::Full,
         });
     if active.control.signal() == scanner::ControlSignal::Paused {
         p.phase = ScanPhase::Paused;
@@ -449,8 +831,104 @@ pub fn scan_status(state: State<'_, AppState>) -> AppResult<Option<ScanProgress>
 // 扫描执行
 // ---------------------------------------------------------------------------
 
+fn begin_job(
+    db: &Db,
+    slot: &Arc<Mutex<ScanSlot>>,
+    repository_id: i64,
+) -> AppResult<(u64, ScanControl, Arc<Mutex<Option<ScanProgress>>>)> {
+    let _ = db;
+    let mut guard = slot.lock().map_err(|e| AppError::Internal(e.to_string()))?;
+    if guard.active.is_some() {
+        return Err(AppError::ScanBusy);
+    }
+    let job_id = guard.alloc_job_id();
+    let control = ScanControl::new();
+    let last: Arc<Mutex<Option<ScanProgress>>> = Arc::new(Mutex::new(None));
+    guard.active = Some(ActiveScan {
+        job_id,
+        repository_id,
+        control: control.clone(),
+        last: last.clone(),
+    });
+    Ok((job_id, control, last))
+}
+
+fn insert_job_row(db: &Db, repository_id: i64) -> AppResult<()> {
+    db.with(|conn| {
+        conn.execute(
+            "INSERT INTO scan_jobs(repository_id, started_at, status) VALUES(?1, ?2, 'running')",
+            params![repository_id, Db::now()],
+        )?;
+        Ok(())
+    })
+}
+
+fn release_job(slot: &Arc<Mutex<ScanSlot>>, job_id: u64) {
+    if let Ok(mut guard) = slot.lock() {
+        if guard
+            .active
+            .as_ref()
+            .map(|a| a.job_id == job_id)
+            .unwrap_or(false)
+        {
+            guard.active = None;
+        }
+    }
+}
+
+fn persist_progress(last: &Arc<Mutex<Option<ScanProgress>>>, p: &ScanProgress) {
+    if let Ok(mut g) = last.lock() {
+        *g = Some(p.clone());
+    }
+}
+
+fn save_checkpoint_every(db: &Db, repository_id: i64, done: u32, total: u32) {
+    let _ = db.with(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO scan_checkpoints(repository_id, next_index, total_entries, committed_games, updated_at)
+             VALUES(?1, ?2, ?3, 0, ?4)",
+            params![repository_id, done as i64, total as i64, Db::now()],
+        )?;
+        Ok(())
+    });
+}
+
+fn finish_cancelled(app: &AppHandle, db: &Db, repository_id: i64, job_id: u64) {
+    let _ = db.with(|conn| {
+        conn.execute(
+            "DELETE FROM scan_checkpoints WHERE repository_id=?1",
+            params![repository_id],
+        )?;
+        conn.execute(
+            "UPDATE scan_jobs SET status='cancelled', finished_at=?1
+             WHERE repository_id=?2 AND status IN ('running','paused')",
+            params![Db::now(), repository_id],
+        )?;
+        Ok(())
+    });
+    let _ = app.emit(
+        "scan://failed",
+        serde_json::json!({ "job_id": job_id, "message": "扫描已取消" }),
+    );
+}
+
+fn finish_failed(app: &AppHandle, db: &Db, repository_id: i64, job_id: u64, err: &str) {
+    let _ = db.with(|conn| {
+        conn.execute(
+            "UPDATE scan_jobs SET status='failed', finished_at=?1, error_message=?2
+             WHERE repository_id=?3 AND status IN ('running','paused')",
+            params![Db::now(), err, repository_id],
+        )?;
+        Ok(())
+    });
+    let _ = app.emit(
+        "scan://failed",
+        serde_json::json!({ "job_id": job_id, "message": err }),
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
-fn run_scan(
+fn run_full_scan(
     app: AppHandle,
     db: Arc<Db>,
     slot: Arc<Mutex<ScanSlot>>,
@@ -461,7 +939,7 @@ fn run_scan(
     start_index: u32,
     root: String,
 ) {
-    let config = ScanConfig::default();
+    let config = load_scan_config(&db);
     let mut last_emit = Instant::now();
     let mut last_saved = 0u32;
 
@@ -480,10 +958,9 @@ fn run_scan(
                 current: ev.current.map(|s| s.to_string()),
                 phase: ScanPhase::Scanning,
                 warnings: 0,
+                scope: ScanScope::Full,
             };
-            if let Ok(mut g) = last.lock() {
-                *g = Some(progress.clone());
-            }
+            persist_progress(&last, &progress);
             // 节流 ≥100ms（§7.2）
             if last_emit.elapsed() >= Duration::from_millis(100) {
                 let _ = app.emit("scan://progress", &progress);
@@ -491,101 +968,160 @@ fn run_scan(
             }
             // 每 50 条落一次断点（避免频繁写库）
             if ev.done - last_saved >= 50 {
-                let _ = db.with(|conn| {
-                    conn.execute(
-                        "INSERT OR REPLACE INTO scan_checkpoints(repository_id, next_index, total_entries, committed_games, updated_at)
-                         VALUES(?1, ?2, ?3, 0, ?4)",
-                        params![repository_id, ev.done as i64, ev.total as i64, Db::now()],
-                    )?;
-                    Ok(())
-                });
+                save_checkpoint_every(&db, repository_id, ev.done, ev.total);
                 last_saved = ev.done;
             }
         },
     );
 
-    let cancelled = result.cancelled || control.signal() == scanner::ControlSignal::Cancelled;
-
+    let cancelled =
+        result.cancelled || control.signal() == scanner::ControlSignal::Cancelled;
     if cancelled {
-        // 取消：清除断点与未提交草稿（D10）
+        finish_cancelled(&app, &db, repository_id, job_id);
+        release_job(&slot, job_id);
+        return;
+    }
+
+    let warnings = result.report.warnings;
+    match store::apply_report(
+        &db,
+        repository_id,
+        &result.report.games,
+        start_index == 0,
+    ) {
+        Ok(outcome) => {
+            let _ = db.with(|conn| {
+                conn.execute(
+                    "DELETE FROM scan_checkpoints WHERE repository_id=?1",
+                    params![repository_id],
+                )?;
+                conn.execute(
+                    "UPDATE repositories SET last_scan_at=?1, is_offline=0 WHERE id=?2",
+                    params![Db::now(), repository_id],
+                )?;
+                conn.execute(
+                    "UPDATE scan_jobs SET status='done', finished_at=?1, found_count=?2, warning_count=?3
+                     WHERE repository_id=?4 AND status IN ('running','paused')",
+                    params![
+                        Db::now(),
+                        (outcome.added + outcome.updated) as i64,
+                        warnings.total() as i64,
+                        repository_id
+                    ],
+                )?;
+                Ok(())
+            });
+            let summary = ScanSummary {
+                job_id,
+                repository_id,
+                found_count: result.report.games.len() as u32,
+                added: outcome.added,
+                updated: outcome.updated,
+                missing: outcome.missing,
+                warning_count: warnings.total(),
+                root_loose_files: warnings.root_loose_files,
+                truncated_with_version_dirs: warnings.truncated_with_version_dirs,
+                enum_failed: warnings.enum_failed,
+                scope: ScanScope::Full,
+            };
+            let _ = app.emit("scan://finished", &summary);
+        }
+        Err(e) => finish_failed(&app, &db, repository_id, job_id, &e.to_string()),
+    }
+    release_job(&slot, job_id);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_single_scan(
+    app: AppHandle,
+    db: Arc<Db>,
+    slot: Arc<Mutex<ScanSlot>>,
+    repository_id: i64,
+    game_id: i64,
+    job_id: u64,
+    control: ScanControl,
+    last: Arc<Mutex<Option<ScanProgress>>>,
+    root: String,
+    game_rel: String,
+) {
+    let config = load_scan_config(&db);
+
+    let progress = ScanProgress {
+        job_id,
+        repository_id,
+        done: 0,
+        total: 1,
+        found_games: 0,
+        current: Some(game_rel.clone()),
+        phase: ScanPhase::Scanning,
+        warnings: 0,
+        scope: ScanScope::Single,
+    };
+    persist_progress(&last, &progress);
+    let _ = app.emit("scan://progress", &progress);
+
+    if control.signal() == scanner::ControlSignal::Cancelled {
+        finish_cancelled(&app, &db, repository_id, job_id);
+        release_job(&slot, job_id);
+        return;
+    }
+
+    let (game, warnings) = scanner::scan_one_game(Path::new(&root), &game_rel, &config);
+    let direction = root_display(&root);
+
+    // 目录已不存在 → 标记 missing 并明确报错，不静默
+    let dir = join_rel(Path::new(&root), &game_rel);
+    if !dir.is_dir() {
         let _ = db.with(|conn| {
             conn.execute(
-                "DELETE FROM scan_checkpoints WHERE repository_id=?1",
-                params![repository_id],
-            )?;
-            conn.execute(
-                "UPDATE scan_jobs SET status='cancelled', finished_at=?1 WHERE repository_id=?2 AND status IN ('running','paused')",
-                params![Db::now(), repository_id],
+                "UPDATE games SET status='missing', updated_at=?1 WHERE id=?2",
+                params![Db::now(), game_id],
             )?;
             Ok(())
         });
-        let _ = app.emit(
-            "scan://failed",
-            serde_json::json!({ "job_id": job_id, "message": "扫描已取消" }),
+        finish_failed(
+            &app,
+            &db,
+            repository_id,
+            job_id,
+            &format!("目录已不存在：{direction}\\{game_rel}"),
         );
-    } else {
-        match store::apply_results(&db, repository_id, &result.games, start_index == 0) {
-            Ok((added, updated, missing)) => {
-                let _ = db.with(|conn| {
-                    conn.execute(
-                        "DELETE FROM scan_checkpoints WHERE repository_id=?1",
-                        params![repository_id],
-                    )?;
-                    conn.execute(
-                        "UPDATE repositories SET last_scan_at=?1, is_offline=0 WHERE id=?2",
-                        params![Db::now(), repository_id],
-                    )?;
-                    conn.execute(
-                        "UPDATE scan_jobs SET status='done', finished_at=?1, found_count=?2, warning_count=?3
-                         WHERE repository_id=?4 AND status IN ('running','paused')",
-                        params![
-                            Db::now(),
-                            (added + updated) as i64,
-                            result.warnings as i64,
-                            repository_id
-                        ],
-                    )?;
-                    Ok(())
-                });
-                let summary = ScanSummary {
-                    job_id,
-                    repository_id,
-                    found_count: result.games.len() as u32,
-                    added,
-                    updated,
-                    missing,
-                    warning_count: result.warnings,
-                };
-                let _ = app.emit("scan://finished", &summary);
-            }
-            Err(e) => {
-                let _ = db.with(|conn| {
-                    conn.execute(
-                        "UPDATE scan_jobs SET status='failed', finished_at=?1, error_message=?2
-                         WHERE repository_id=?3 AND status IN ('running','paused')",
-                        params![Db::now(), e.to_string(), repository_id],
-                    )?;
-                    Ok(())
-                });
-                let _ = app.emit(
-                    "scan://failed",
-                    serde_json::json!({ "job_id": job_id, "message": e.to_string() }),
-                );
-            }
-        }
+        release_job(&slot, job_id);
+        return;
     }
 
-    // 释放活跃槽
-    if let Ok(mut guard) = slot.lock() {
-        if guard
-            .active
-            .as_ref()
-            .map(|a| a.job_id == job_id)
-            .unwrap_or(false)
-        {
-            guard.active = None;
+    match store::apply_single(&db, game_id, &game) {
+        Ok(outcome) => {
+            let _ = db.with(|conn| {
+                conn.execute(
+                    "UPDATE repositories SET last_scan_at=?1, is_offline=0 WHERE id=?2",
+                    params![Db::now(), repository_id],
+                )?;
+                conn.execute(
+                    "UPDATE scan_jobs SET status='done', finished_at=?1, found_count=1, warning_count=?2
+                     WHERE repository_id=?3 AND status IN ('running','paused')",
+                    params![Db::now(), warnings.total() as i64, repository_id],
+                )?;
+                Ok(())
+            });
+            let summary = ScanSummary {
+                job_id,
+                repository_id,
+                found_count: 1,
+                added: outcome.added,
+                updated: outcome.updated,
+                missing: outcome.missing,
+                warning_count: warnings.total(),
+                root_loose_files: warnings.root_loose_files,
+                truncated_with_version_dirs: warnings.truncated_with_version_dirs,
+                enum_failed: warnings.enum_failed,
+                scope: ScanScope::Single,
+            };
+            let _ = app.emit("scan://finished", &summary);
         }
+        Err(e) => finish_failed(&app, &db, repository_id, job_id, &e.to_string()),
     }
+    release_job(&slot, job_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -597,15 +1133,74 @@ fn map_game_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<GameRow> {
         id: r.get(0)?,
         repository_id: r.get(1)?,
         relative_path: r.get(2)?,
-        group_key: r.get(3)?,
-        game_type: r.get(4)?,
-        display_name: r.get(5)?,
-        game_code: r.get(6)?,
-        cover_path: r.get(7)?,
-        size_bytes: r.get(8)?,
-        status: r.get(9)?,
+        layout: r.get(3)?,
+        display_name: r.get(4)?,
+        game_code: r.get(5)?,
+        cover_path: r.get(6)?,
+        size_bytes: r.get(7)?,
+        status: r.get(8)?,
+        selected_version_id: r.get(9)?,
         updated_at: r.get(10)?,
+        version_count: r.get(11)?,
+        selected_version_label: r.get(12)?,
     })
+}
+
+fn load_versions(conn: &Connection, game_id: i64) -> AppResult<Vec<GameVersionRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, game_id, relative_path, version_label, display_name, note, game_type,
+                size_bytes, source, status, updated_at
+         FROM game_versions WHERE game_id=?1
+         ORDER BY version_label COLLATE NOCASE ASC",
+    )?;
+    let mut rows: Vec<GameVersionRow> = stmt
+        .query_map(params![game_id], |r| {
+            Ok(GameVersionRow {
+                id: r.get(0)?,
+                game_id: r.get(1)?,
+                relative_path: r.get(2)?,
+                version_label: r.get(3)?,
+                display_name: r.get(4)?,
+                note: r.get(5)?,
+                game_type: r.get(6)?,
+                size_bytes: r.get(7)?,
+                source: r.get(8)?,
+                status: r.get(9)?,
+                updated_at: r.get(10)?,
+                executables: Vec::new(),
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
+
+    for v in &mut rows {
+        v.executables = load_executables(conn, v.id)?;
+    }
+    Ok(rows)
+}
+
+fn load_executables(conn: &Connection, version_id: i64) -> AppResult<Vec<ExecutableRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, relative_path, file_name, size_bytes, is_selected, source, invalid
+         FROM game_version_executables WHERE version_id=?1
+         ORDER BY is_selected DESC, invalid ASC, file_name COLLATE NOCASE ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![version_id], |r| {
+            Ok(ExecutableRow {
+                id: r.get(0)?,
+                relative_path: r.get(1)?,
+                file_name: r.get(2)?,
+                size_bytes: r.get(3)?,
+                is_selected: r.get::<_, i64>(4)? != 0,
+                source: r.get(5)?,
+                invalid: r.get::<_, i64>(6)? != 0,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
 }
 
 fn load_repository(conn: &Connection, id: i64) -> AppResult<RepositoryRow> {
@@ -650,17 +1245,102 @@ fn load_locators(conn: &Connection, repository_id: i64) -> AppResult<Vec<Reposit
     Ok(rows)
 }
 
-fn load_checkpoint(db: &Db, repository_id: i64) -> AppResult<u32> {
-    db.with(|conn| {
-        let v: Option<i64> = conn
-            .query_row(
-                "SELECT next_index FROM scan_checkpoints WHERE repository_id=?1",
-                params![repository_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(v.unwrap_or(0).max(0) as u32)
-    })
+/// 解析仓库可达路径（D16：盘符 → IP → 主机名，按可达性跳过）
+fn resolve_repository(db: &Db, repository_id: i64) -> AppResult<String> {
+    let locators = db.with(|conn| load_locators(conn, repository_id))?;
+    match locator::resolve(&locators) {
+        Some((kind, path)) => {
+            db.with(|conn| {
+                conn.execute(
+                    "UPDATE repositories SET active_locator=?1, is_offline=0 WHERE id=?2",
+                    params![kind.as_str(), repository_id],
+                )?;
+                conn.execute(
+                    "UPDATE repository_locators SET last_ok_at=?1 WHERE repository_id=?2 AND kind=?3",
+                    params![Db::now(), repository_id, kind.as_str()],
+                )?;
+                Ok(())
+            })?;
+            Ok(path)
+        }
+        None => {
+            db.with(|conn| {
+                conn.execute(
+                    "UPDATE repositories SET is_offline=1 WHERE id=?1",
+                    params![repository_id],
+                )?;
+                Ok(())
+            })?;
+            Err(AppError::RepositoryUnreachable)
+        }
+    }
+}
+
+/// 加载扫描配置（根级目录排除名单来自 settings）
+fn load_scan_config(db: &Db) -> ScanConfig {
+    let mut config = ScanConfig::default();
+    if let Ok(raw) = db.get_setting("root_excluded_dirs") {
+        let parsed = scanner::parse_root_excluded(raw);
+        if !parsed.is_empty() {
+            config.root_excluded_dirs = parsed;
+        }
+    }
+    config
+}
+
+fn root_display(root: &str) -> String {
+    root.trim_end_matches(['\\', '/']).to_string()
+}
+
+/// 相对路径拼接（"/" 分隔）
+fn join_rel(root: &Path, rel: &str) -> std::path::PathBuf {
+    let mut p = root.to_path_buf();
+    for seg in rel.split('/').filter(|s| !s.is_empty()) {
+        p.push(seg);
+    }
+    p
+}
+
+fn normalize_rel_arg(rel: &str) -> String {
+    rel.replace('\\', "/")
+        .trim_matches('/')
+        .to_string()
+}
+
+/// 递归收集可执行文件候选（仅用于手动配置，深度受限）
+fn collect_exes(
+    dir: &Path,
+    rel: &str,
+    depth: u32,
+    max_depth: u32,
+    out: &mut Vec<ExeCandidate>,
+) {
+    let Ok(entries) = std::fs::read_dir(scanner::extend_path(dir)) else {
+        return;
+    };
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() {
+            subdirs.push((entry.path(), name));
+            continue;
+        }
+        if !name.to_lowercase().ends_with(".exe") {
+            continue;
+        }
+        out.push(ExeCandidate {
+            relative_path: format!("{rel}/{name}"),
+            file_name: name,
+            size_bytes: meta.len(),
+        });
+    }
+    if depth >= max_depth {
+        return;
+    }
+    for (path, name) in subdirs {
+        collect_exes(&path, &format!("{rel}/{name}"), depth + 1, max_depth, out);
+    }
 }
 
 /// 拼接绝对路径（详情页"本机详情"）
@@ -675,16 +1355,27 @@ fn absolute_path(conn: &Connection, row: &GameRow) -> AppResult<Option<String>> 
         .map(|l| l.path_template.clone());
 
     Ok(base.map(|b| {
-        if row.relative_path.contains('/') || row.relative_path.contains('\\') {
-            format!(
-                "{}\\{}",
-                b.trim_end_matches(['\\', '/']),
-                row.relative_path.replace('/', "\\")
-            )
-        } else {
-            format!("{}\\{}", b.trim_end_matches(['\\', '/']), row.relative_path)
-        }
+        format!(
+            "{}\\{}",
+            b.trim_end_matches(['\\', '/']),
+            row.relative_path.replace('/', "\\")
+        )
     }))
+}
+
+fn repository_display_name(payload: &NewRepository) -> String {
+    payload
+        .name
+        .clone()
+        .filter(|n| !n.trim().is_empty())
+        .or_else(|| {
+            payload
+                .locators
+                .iter()
+                .find(|l| l.kind == "drive")
+                .map(|l| l.path_template.clone())
+        })
+        .unwrap_or_else(|| payload.relative_root.clone())
 }
 
 fn validate_new_repository(payload: &NewRepository) -> AppResult<()> {
