@@ -335,6 +335,7 @@ pub fn set_selected_executable(
             return Err(AppError::ExecutableNotFound(executable_id));
         }
         let now = Db::now();
+        // 启动项在每个版本内唯一（各版本可各自保留自己的启动项配置）
         tx.execute(
             "UPDATE game_version_executables SET is_selected=0 WHERE version_id=?1",
             params![version_id],

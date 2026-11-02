@@ -3,6 +3,7 @@ import { ref, reactive, computed, onMounted, onUnmounted } from "vue";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { api, errorText, onScanFailed, onScanFinished, onScanProgress } from "../api";
+import { askConfirm } from "../confirm";
 import type { BlocklistRow, NewRepository, RepositoryRow, ScanProgress } from "../types";
 
 const emit = defineEmits<{ toast: [text: string, error?: boolean] }>();
@@ -148,10 +149,18 @@ async function addRepo() {
 }
 
 async function removeRepo(repo: RepositoryRow) {
-  if (!window.confirm(`删除仓库「${repo.name}」？该仓库下所有档案将被一并删除。`)) return;
+  const ok = await askConfirm(
+    "删除仓库",
+    `将删除仓库「${repo.name}」。\n\n` +
+      `该仓库下所有档案与版本都会被一并删除（含手填的名称、编号、封面），` +
+      `且不进入黑名单；重新添加后需要重新扫描。`,
+    { confirmText: "删除仓库", danger: true },
+  );
+  if (!ok) return;
   try {
     await api.deleteRepository(repo.id);
     await loadRepos();
+    await loadBlocklist();
     emit("toast", "仓库已删除");
   } catch (e) {
     emit("toast", errorText(e), true);

@@ -4,6 +4,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { api, errorText, formatBytes, onScanFinished } from "../api";
+import { askConfirm } from "../confirm";
 import type { ExeCandidate, ExecutableRow, GameDetail, GameVersionRow } from "../types";
 
 const props = defineProps<{ gameId: number }>();
@@ -41,10 +42,22 @@ const versions = computed(() => detail.value?.versions ?? []);
 const currentVersion = computed(
   () => versions.value.find((v) => v.id === detail.value?.selected_version_id) ?? null,
 );
-const launchLabel = computed(() =>
-  currentVersion.value ? `启动：${currentVersion.value.display_name}` : "无可用版本",
+
+/** 该版本是否已选择启动项 */
+function hasLaunchItem(v: GameVersionRow) {
+  return v.executables.some((e) => e.is_selected);
+}
+
+/** 启动列表只列出「已选择启动项」的版本；未配置启动项的版本不出现 */
+const launchableVersions = computed(() => versions.value.filter(hasLaunchItem));
+const canLaunch = computed(
+  () => currentVersion.value !== null && hasLaunchItem(currentVersion.value),
 );
-const canLaunch = computed(() => currentVersion.value !== null);
+const launchLabel = computed(() => {
+  if (!currentVersion.value) return "无可用版本";
+  if (!canLaunch.value) return "未配置启动项";
+  return `启动：${currentVersion.value.display_name}`;
+});
 
 const coverSrc = computed(() => {
   const p = detail.value?.cover_path;
@@ -223,9 +236,11 @@ async function saveNote(v: GameVersionRow) {
 }
 
 async function removeVersion(v: GameVersionRow) {
-  const ok = window.confirm(
-    `删除版本「${v.display_name}」？\n\n` +
+  const ok = await askConfirm(
+    "删除版本",
+    `将删除版本「${v.display_name}」并加入黑名单。\n\n` +
       `这会丢弃该版本的可执行文件配置与备注，且重新扫描不会恢复（取消拉黑也不会）。`,
+    { confirmText: "删除", danger: true },
   );
   if (!ok) return;
   try {
@@ -239,10 +254,12 @@ async function removeVersion(v: GameVersionRow) {
 
 async function removeGame() {
   if (!detail.value) return;
-  const ok = window.confirm(
-    `删除档案「${detail.value.display_name}」？\n\n` +
+  const ok = await askConfirm(
+    "删除档案",
+    `将删除档案「${detail.value.display_name}」并加入黑名单。\n\n` +
       `这会丢弃已填写的名称、编号、封面，以及其下所有版本的配置；` +
       `重新扫描不会恢复（取消拉黑也不会）。`,
+    { confirmText: "删除档案", danger: true },
   );
   if (!ok) return;
   try {
@@ -392,7 +409,7 @@ onUnmounted(() => {
           </div>
           <div v-if="pickerOpen" class="launch-menu">
             <button
-              v-for="v in versions"
+              v-for="v in launchableVersions"
               :key="v.id"
               class="launch-item"
               :class="{ active: v.id === detail.selected_version_id }"
@@ -401,7 +418,10 @@ onUnmounted(() => {
               <span>{{ v.display_name }}</span>
               <span class="faint">{{ formatBytes(v.size_bytes) }}</span>
             </button>
-            <div v-if="versions.length === 0" class="faint launch-empty">无可用版本</div>
+            <div v-if="launchableVersions.length === 0" class="faint launch-empty">
+              没有已配置启动项的版本<br />
+              <span class="faint">到「版本管理」里为版本选择启动项后才会出现在这里</span>
+            </div>
           </div>
         </div>
       </div>
@@ -448,6 +468,7 @@ onUnmounted(() => {
               <span class="tag" v-if="v.source === 'manual'">手动</span>
               <span class="tag" v-if="v.game_type === 'archive'">压缩包</span>
               <span class="tag off" v-if="v.status === 'missing'">缺失</span>
+              <span class="tag off" v-if="!hasLaunchItem(v)">未配启动项</span>
               <span class="faint version-size">{{ formatBytes(v.size_bytes) }}</span>
               <span class="version-caret">{{ expanded.includes(v.id) ? "▾" : "▸" }}</span>
             </button>

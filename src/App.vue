@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import Sidebar from "./components/Sidebar.vue";
+import ConfirmDialog from "./components/ConfirmDialog.vue";
 import HomeView from "./views/HomeView.vue";
 import GameDetailView from "./views/GameDetailView.vue";
 import SettingsView from "./views/SettingsView.vue";
@@ -52,5 +53,8 @@ function openGame(id: number) {
     </main>
 
     <div v-if="toast" class="toast" :class="{ error: toast.error }">{{ toast.text }}</div>
+
+    <!-- 全局确认对话框（替代 window.confirm） -->
+    <ConfirmDialog />
   </div>
 </template>

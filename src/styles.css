@@ -357,6 +357,7 @@ input:focus {
 }
 
 .detail-cover {
+  position: relative;
   width: 180px;
   aspect-ratio: 3 / 4;
   background: linear-gradient(160deg, #232833, #1a1d24);
@@ -836,4 +837,57 @@ input:focus {
   padding: 1px 6px;
   font-size: 11px;
   color: var(--text-dim);
+}
+
+/* 确认对话框（替代系统 window.confirm） */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(6, 8, 11, 0.62);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+}
+
+.modal {
+  width: 420px;
+  max-width: calc(100vw - 48px);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 20px 56px rgba(0, 0, 0, 0.6);
+  padding: 18px 20px 16px;
+}
+
+.modal-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 12px;
+}
+
+.modal-body {
+  font-size: 13px;
+  line-height: 1.75;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin-bottom: 18px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+button.danger-solid {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
+button.danger-solid:hover:not(:disabled) {
+  background: #ef6b6b;
+  border-color: #ef6b6b;
 }
