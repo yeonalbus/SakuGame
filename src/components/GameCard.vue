@@ -46,6 +46,7 @@ function open() {
       <img v-if="coverSrc" :src="coverSrc" alt="" @error="imgFailed = true" />
       <div v-else class="placeholder">{{ game.display_name }}</div>
       <span v-if="badge" class="badge">{{ badge }}</span>
+      <span v-if="game.version_count > 1" class="version-badge">{{ game.version_count }} 版本</span>
     </div>
     <div class="card-title">
       <span ref="titleEl">{{ game.display_name }}</span>

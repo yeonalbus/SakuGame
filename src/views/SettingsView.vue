@@ -3,16 +3,24 @@ import { ref, reactive, computed, onMounted, onUnmounted } from "vue";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { api, errorText, onScanFailed, onScanFinished, onScanProgress } from "../api";
-import type { NewRepository, RepositoryRow, ScanProgress } from "../types";
+import type { BlocklistRow, NewRepository, RepositoryRow, ScanProgress } from "../types";
 
 const emit = defineEmits<{ toast: [text: string, error?: boolean] }>();
 
-const tab = ref<"repos" | "about">("repos");
+const tab = ref<"repos" | "blocklist" | "about">("repos");
 const repos = ref<RepositoryRow[]>([]);
+const blocklist = ref<BlocklistRow[]>([]);
 const progress = ref<ScanProgress | null>(null);
 const version = ref("");
 const showForm = ref(false);
 const busy = ref(false);
+
+/** 最近一次扫描的可见性告警明细 */
+const lastWarnings = ref<{
+  root_loose_files: number;
+  truncated_with_version_dirs: number;
+  enum_failed: number;
+} | null>(null);
 
 const form = reactive({ drive: "", ip: "", host: "" });
 const unlisteners: UnlistenFn[] = [];
@@ -26,10 +34,23 @@ const pct = computed(() => {
   if (!p || !p.total) return 0;
   return Math.min(100, Math.round((p.done / p.total) * 100));
 });
+const warningTotal = computed(() => {
+  const w = lastWarnings.value;
+  if (!w) return 0;
+  return w.root_loose_files + w.truncated_with_version_dirs + w.enum_failed;
+});
 
 async function loadRepos() {
   try {
     repos.value = await api.listRepositories();
+  } catch (e) {
+    emit("toast", errorText(e), true);
+  }
+}
+
+async function loadBlocklist() {
+  try {
+    blocklist.value = await api.listBlocklist();
   } catch (e) {
     emit("toast", errorText(e), true);
   }
@@ -46,6 +67,7 @@ async function refreshProgress() {
 async function scan(repo: RepositoryRow) {
   try {
     busy.value = true;
+    lastWarnings.value = null;
     await api.startScan(repo.id);
     await refreshProgress();
   } catch (e) {
@@ -77,6 +99,16 @@ async function cancel() {
   try {
     await api.cancelScan();
     progress.value = null;
+  } catch (e) {
+    emit("toast", errorText(e), true);
+  }
+}
+
+async function unblock(row: BlocklistRow) {
+  try {
+    await api.unblock(row.id);
+    await loadBlocklist();
+    emit("toast", "已取消拉黑，下次扫描会重新纳入");
   } catch (e) {
     emit("toast", errorText(e), true);
   }
@@ -151,6 +183,7 @@ function fmtTime(v: string | null): string {
 
 onMounted(async () => {
   await loadRepos();
+  await loadBlocklist();
   await refreshProgress();
   version.value = await getVersion().catch(() => "0.1.0");
   unlisteners.push(
@@ -161,10 +194,16 @@ onMounted(async () => {
   unlisteners.push(
     await onScanFinished((s) => {
       progress.value = null;
+      lastWarnings.value = {
+        root_loose_files: s.root_loose_files,
+        truncated_with_version_dirs: s.truncated_with_version_dirs,
+        enum_failed: s.enum_failed,
+      };
       void loadRepos();
+      const scopeText = s.scope === "single" ? "（单档案）" : "";
       emit(
         "toast",
-        `扫描完成：新增 ${s.added}，更新 ${s.updated}，缺失 ${s.missing}，警告 ${s.warning_count}`,
+        `扫描完成${scopeText}：新增 ${s.added}，更新 ${s.updated}，缺失 ${s.missing}，警告 ${s.warning_count}`,
         false,
       );
     }),
@@ -188,6 +227,16 @@ onUnmounted(() => {
       <button class="nav-item" :class="{ active: tab === 'repos' }" @click="tab = 'repos'">
         仓库管理
       </button>
+      <button
+        class="nav-item"
+        :class="{ active: tab === 'blocklist' }"
+        @click="
+          tab = 'blocklist';
+          loadBlocklist();
+        "
+      >
+        黑名单（{{ blocklist.length }}）
+      </button>
       <button class="nav-item" :class="{ active: tab === 'about' }" @click="tab = 'about'">
         关于
       </button>
@@ -199,7 +248,9 @@ onUnmounted(() => {
         <div v-if="progress">
           <div class="progress-row">
             <span>{{ progress.done }} / {{ progress.total }}</span>
-            <span class="muted">已发现 {{ progress.found_games }} 个</span>
+            <span class="muted">
+              {{ progress.scope === "single" ? "单档案重扫" : "已发现 " + progress.found_games + " 个" }}
+            </span>
           </div>
           <div class="progress-bar"><i :style="{ width: pct + '%' }"></i></div>
           <div class="faint" style="margin-top: 6px">
@@ -212,6 +263,20 @@ onUnmounted(() => {
           </div>
         </div>
         <div v-else class="muted">当前没有正在进行的扫描</div>
+      </div>
+
+      <!-- 可见性告警明细 -->
+      <div v-if="lastWarnings && warningTotal > 0" class="warn-box">
+        <div class="warn-title">上次扫描告警（{{ warningTotal }}）</div>
+        <div v-if="lastWarnings.root_loose_files" class="warn-line">
+          · 仓库根目录下有 {{ lastWarnings.root_loose_files }} 个散落文件未被识别（请放入子目录）
+        </div>
+        <div v-if="lastWarnings.truncated_with_version_dirs" class="warn-line">
+          · {{ lastWarnings.truncated_with_version_dirs }} 个目录因自身含可执行文件被截断，其子目录未参与版本识别
+        </div>
+        <div v-if="lastWarnings.enum_failed" class="warn-line">
+          · {{ lastWarnings.enum_failed }} 个目录枚举失败（权限 / 长路径 / 网络）
+        </div>
       </div>
 
       <!-- 下栏：扫描按钮 + 路径条目 -->
@@ -264,6 +329,24 @@ onUnmounted(() => {
           </div>
           <button class="primary" @click="addRepo">确认添加</button>
         </div>
+      </div>
+    </div>
+
+    <div v-else-if="tab === 'blocklist'">
+      <div class="section">
+        <h3>黑名单</h3>
+        <div class="faint" style="margin-bottom: 12px">
+          删除的档案与版本会保留在这里，避免下次扫描重复判定。取消拉黑后，下次扫描会重新纳入；
+          但不会恢复已丢弃的手填数据（名称 / 编号 / 封面 / 版本配置）。
+        </div>
+        <div v-for="row in blocklist" :key="row.id" class="block-row">
+          <span class="tag" :class="row.kind === 'game' ? 'ok' : ''">
+            {{ row.kind === "game" ? "档案" : "版本" }}
+          </span>
+          <span class="mono block-path">{{ row.relative_path }}</span>
+          <button @click="unblock(row)">取消拉黑</button>
+        </div>
+        <div v-if="blocklist.length === 0" class="faint">黑名单为空</div>
       </div>
     </div>
 

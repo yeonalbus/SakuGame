@@ -390,6 +390,9 @@ input:focus {
 }
 
 .detail-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 20px;
   font-weight: 600;
   margin: 0 0 10px;
@@ -468,4 +471,369 @@ input:focus {
 
 .toast.error {
   border-left-color: var(--danger);
+}
+
+/* ==========================================================================
+   v1.1：版本管理与可执行文件配置
+   ========================================================================== */
+
+/* 详情页顶部操作条 */
+.detail-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.detail-topbar-right {
+  display: flex;
+  gap: 8px;
+}
+
+/* 封面右上角"改封面"角标 */
+.cover-edit {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 6px;
+  background: rgba(10, 12, 16, 0.78);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.cover-placeholder {
+  word-break: break-all;
+  line-height: 1.4;
+}
+
+/* 图标按钮（改名 / 改编号） */
+.icon-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-faint);
+  padding: 2px 6px;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.icon-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.icon-btn.danger {
+  color: var(--danger);
+  border: none;
+}
+
+.icon-btn.danger:hover {
+  background: #3a2222;
+}
+
+.title-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 20px;
+  font-weight: 600;
+  max-width: none;
+}
+
+.detail-code {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+  font-size: 13px;
+}
+
+.code-input {
+  width: 180px;
+}
+
+/* 启动按钮 */
+.launch-wrap {
+  position: relative;
+  display: inline-block;
+}
+
+.launch {
+  display: flex;
+}
+
+.launch-main {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  border-right: none;
+  min-width: 220px;
+  text-align: left;
+}
+
+.launch-caret {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  padding: 6px 10px;
+}
+
+.launch-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  min-width: 100%;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+  padding: 6px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 280px;
+  overflow: auto;
+}
+
+.launch-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: transparent;
+  border: none;
+  text-align: left;
+  padding: 7px 10px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+.launch-item:hover {
+  background: var(--bg-hover);
+}
+
+.launch-item.active {
+  background: var(--bg-active);
+}
+
+.launch-empty {
+  padding: 8px 10px;
+}
+
+/* 版本列表 */
+.version-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.version-item {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.version-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+}
+
+.version-toggle {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: transparent;
+  border: none;
+  text-align: left;
+  padding: 4px 6px;
+  border-radius: 6px;
+  min-width: 0;
+}
+
+.version-toggle:hover {
+  background: var(--bg-hover);
+}
+
+.version-name {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.version-size {
+  margin-left: auto;
+}
+
+.version-caret {
+  color: var(--text-faint);
+  font-size: 12px;
+  width: 12px;
+}
+
+.version-body {
+  border-top: 1px solid var(--border);
+  padding: 12px 14px 14px;
+}
+
+.version-empty {
+  background: var(--bg-elev);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 24px;
+  text-align: center;
+  font-size: 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.inline-input {
+  width: 100%;
+  max-width: 420px;
+}
+
+.mono {
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+}
+
+/* 可执行文件候选 */
+.exe-block {
+  margin-top: 14px;
+}
+
+.exe-title {
+  margin-bottom: 6px;
+}
+
+.exe-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.exe-row:hover {
+  background: var(--bg-hover);
+}
+
+.exe-name {
+  font-size: 13px;
+}
+
+.exe-invalid {
+  text-decoration: line-through;
+  color: var(--text-faint);
+}
+
+/* 手动新建版本面板 */
+.manual-open {
+  margin-top: 14px;
+}
+
+.manual-panel {
+  margin-top: 14px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+}
+
+.manual-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0;
+  flex-wrap: wrap;
+}
+
+.manual-exes {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 220px;
+  overflow: auto;
+  margin: 8px 0;
+}
+
+.manual-exe {
+  text-align: left;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  padding: 5px 9px;
+  border-radius: 6px;
+  word-break: break-all;
+}
+
+.manual-exe.active {
+  border-color: var(--accent);
+  background: var(--bg-active);
+}
+
+/* 扫描可见性告警 */
+.warn-box {
+  background: #241f14;
+  border: 1px solid #4a3d20;
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  margin-bottom: 16px;
+  font-size: 13px;
+}
+
+.warn-title {
+  color: #e0b455;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.warn-line {
+  color: var(--text-dim);
+  line-height: 1.7;
+}
+
+/* 黑名单 */
+.block-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 9px 12px;
+  margin-bottom: 8px;
+}
+
+.block-path {
+  flex: 1;
+  word-break: break-all;
+  color: var(--text-dim);
+}
+
+/* 卡片版本数角标 */
+.version-badge {
+  position: absolute;
+  left: 6px;
+  bottom: 6px;
+  background: rgba(10, 12, 16, 0.82);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1px 6px;
+  font-size: 11px;
+  color: var(--text-dim);
 }

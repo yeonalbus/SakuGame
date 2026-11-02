@@ -1,7 +1,11 @@
 // 与 Rust 侧 models.rs 对应的类型（字段保持 snake_case，与 serde 输出一致）
 
 export type GameType = "folder" | "archive";
+/** v1.1：紧凑（游戏标识层自带可执行文件/压缩包）｜标准（由版本层组织） */
+export type GameLayout = "compact" | "standard";
 export type GameStatus = "ok" | "missing";
+export type VersionSource = "scan" | "manual";
+export type ScanScope = "full" | "single";
 export type LocatorKind = "drive" | "ip" | "host";
 export type ScanPhase = "idle" | "scanning" | "paused" | "finishing";
 
@@ -35,22 +39,69 @@ export interface NewRepository {
   locators: NewLocator[];
 }
 
+/** 档案行（= 游戏标识层，1 游戏 1 行） */
 export interface GameRow {
   id: number;
   repository_id: number;
   relative_path: string;
-  group_key: string;
-  game_type: GameType;
+  layout: GameLayout;
   display_name: string;
   game_code: string | null;
   cover_path: string | null;
   size_bytes: number;
   status: GameStatus;
+  version_count: number;
+  selected_version_id: number | null;
+  selected_version_label: string | null;
+  updated_at: string;
+}
+
+/** 版本内的可执行文件 */
+export interface ExecutableRow {
+  id: number;
+  relative_path: string;
+  file_name: string;
+  size_bytes: number;
+  is_selected: boolean;
+  source: VersionSource;
+  /** 上次重扫已找不到该文件 */
+  invalid: boolean;
+}
+
+/** 版本行 */
+export interface GameVersionRow {
+  id: number;
+  game_id: number;
+  relative_path: string;
+  version_label: string;
+  display_name: string;
+  note: string | null;
+  game_type: GameType;
+  size_bytes: number;
+  source: VersionSource;
+  status: GameStatus;
+  executables: ExecutableRow[];
   updated_at: string;
 }
 
 export interface GameDetail extends GameRow {
+  versions: GameVersionRow[];
   absolute_path: string | null;
+}
+
+export interface BlocklistRow {
+  id: number;
+  repository_id: number;
+  kind: "game" | "version";
+  relative_path: string;
+  created_at: string;
+}
+
+/** 手动配置时的可执行文件候选 */
+export interface ExeCandidate {
+  relative_path: string;
+  file_name: string;
+  size_bytes: number;
 }
 
 export interface ScanProgress {
@@ -62,6 +113,7 @@ export interface ScanProgress {
   current: string | null;
   phase: ScanPhase;
   warnings: number;
+  scope: ScanScope;
 }
 
 export interface ScanSummary {
@@ -72,6 +124,10 @@ export interface ScanSummary {
   updated: number;
   missing: number;
   warning_count: number;
+  root_loose_files: number;
+  truncated_with_version_dirs: number;
+  enum_failed: number;
+  scope: ScanScope;
 }
 
 export interface AppErrorPayload {

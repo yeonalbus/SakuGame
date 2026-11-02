@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  BlocklistRow,
+  ExeCandidate,
   GameDetail,
   GameRow,
   NewRepository,
@@ -30,9 +32,44 @@ export const api = {
     gameCode: string | null,
     coverPath: string | null,
   ) => invoke<void>("update_game", { gameId, displayName, gameCode, coverPath }),
+  deleteGame: (gameId: number) => invoke<void>("delete_game", { gameId }),
+
+  // 版本
+  updateVersion: (versionId: number, displayName: string, note: string | null) =>
+    invoke<void>("update_version", { versionId, displayName, note }),
+  setSelectedVersion: (gameId: number, versionId: number) =>
+    invoke<void>("set_selected_version", { gameId, versionId }),
+  setSelectedExecutable: (versionId: number, executableId: number) =>
+    invoke<void>("set_selected_executable", { versionId, executableId }),
+  deleteVersion: (versionId: number) => invoke<void>("delete_version", { versionId }),
+  createManualVersion: (
+    gameId: number,
+    relativePath: string,
+    executableRelativePath: string,
+    displayName?: string | null,
+  ) =>
+    invoke<number>("create_manual_version", {
+      gameId,
+      relativePath,
+      executableRelativePath,
+      displayName: displayName ?? null,
+    }),
+  addManualExecutable: (versionId: number, relativePath: string) =>
+    invoke<number>("add_manual_executable", { versionId, relativePath }),
+  listExecutableCandidates: (repositoryId: number, relativePath: string, maxDepth?: number) =>
+    invoke<ExeCandidate[]>("list_executable_candidates", {
+      repositoryId,
+      relativePath,
+      maxDepth: maxDepth ?? null,
+    }),
+
+  // 黑名单
+  listBlocklist: () => invoke<BlocklistRow[]>("list_blocklist"),
+  unblock: (blocklistId: number) => invoke<void>("unblock", { blocklistId }),
 
   // 扫描
   startScan: (repositoryId: number) => invoke<number>("start_scan", { repositoryId }),
+  scanSingleGame: (gameId: number) => invoke<number>("scan_single_game", { gameId }),
   pauseScan: () => invoke<void>("pause_scan"),
   resumeScan: () => invoke<void>("resume_scan"),
   cancelScan: () => invoke<void>("cancel_scan"),
