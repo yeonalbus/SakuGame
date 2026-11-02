@@ -97,6 +97,12 @@ export interface BlocklistRow {
   created_at: string;
 }
 
+/** 取消拉黑的结果：restored = 是否已立即恢复到列表 / 主页 */
+export interface UnblockOutcome {
+  restored: boolean;
+  message: string;
+}
+
 /** 手动配置时的可执行文件候选 */
 export interface ExeCandidate {
   relative_path: string;

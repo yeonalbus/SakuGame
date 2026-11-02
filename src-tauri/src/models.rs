@@ -383,6 +383,14 @@ pub struct BlocklistRow {
     pub created_at: String,
 }
 
+/// 取消拉黑的结果（v1.1：删除记录后立即尝试恢复，不再等下次扫描）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnblockOutcome {
+    /// 是否已立即恢复
+    pub restored: bool,
+    pub message: String,
+}
+
 /// 扫描结束摘要
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanSummary {

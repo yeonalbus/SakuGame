@@ -14,7 +14,7 @@ use crate::locator;
 use crate::models::{
     BlocklistRow, ExecutableRow, ExeCandidate, GameDetail, GameRow, GameVersionRow, LocatorKind,
     NewRepository, RepositoryLocator, RepositoryRow, ScanPhase, ScanProgress, ScanScope,
-    ScanSummary,
+    ScanSummary, UnblockOutcome,
 };
 use crate::scanner::{self, ScanConfig, ScanControl};
 use crate::state::{ActiveScan, AppState, ScanSlot};
@@ -606,26 +606,13 @@ pub fn delete_game(state: State<'_, AppState>, game_id: i64) -> AppResult<()> {
         };
 
         let now = Db::now();
-        // 级联：档案 + 其下所有版本一并进黑名单
+        // 只写一条档案记录：档案被拉黑后，其下版本目录自然不会参与扫描。
+        // 已被单独拉黑的版本记录保持原样（便于恢复档案时排除这些版本）。
         tx.execute(
             "INSERT OR REPLACE INTO blocklist(repository_id, kind, relative_path, created_at)
              VALUES(?1, 'game', ?2, ?3)",
             params![repository_id, game_rel, now],
         )?;
-        let mut stmt =
-            tx.prepare("SELECT relative_path FROM game_versions WHERE game_id=?1")?;
-        let version_rels: Vec<String> = stmt
-            .query_map(params![game_id], |r| r.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-        drop(stmt);
-        for vrel in version_rels {
-            tx.execute(
-                "INSERT OR REPLACE INTO blocklist(repository_id, kind, relative_path, created_at)
-                 VALUES(?1, 'version', ?2, ?3)",
-                params![repository_id, vrel, now],
-            )?;
-        }
         tx.execute("DELETE FROM games WHERE id=?1", params![game_id])?;
         tx.commit()?;
         Ok(())
@@ -655,18 +642,99 @@ pub fn list_blocklist(state: State<'_, AppState>) -> AppResult<Vec<BlocklistRow>
     })
 }
 
+/// 取消拉黑。返回是否已**立即**恢复（不再等下次扫描）。
 #[tauri::command]
-pub fn unblock(state: State<'_, AppState>, blocklist_id: i64) -> AppResult<()> {
-    state.db.with(|conn| {
-        let affected = conn.execute(
-            "DELETE FROM blocklist WHERE id=?1",
+pub fn unblock(state: State<'_, AppState>, blocklist_id: i64) -> AppResult<UnblockOutcome> {
+    let (kind, relative_path, repository_id): (String, String, i64) = state.db.with(|conn| {
+        conn.query_row(
+            "SELECT kind, relative_path, repository_id FROM blocklist WHERE id=?1",
             params![blocklist_id],
-        )?;
-        if affected == 0 {
-            return Err(AppError::BlocklistNotFound(blocklist_id));
-        }
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+        .ok_or(AppError::BlocklistNotFound(blocklist_id))
+    })?;
+
+    // 先解除拉黑（即使后续恢复失败，记录也应删除）
+    state.db.with(|conn| {
+        conn.execute("DELETE FROM blocklist WHERE id=?1", params![blocklist_id])?;
         Ok(())
-    })
+    })?;
+
+    if kind == "game" {
+        return Ok(try_restore(&state.db, repository_id, &relative_path));
+    }
+
+    // 版本：档案未被拉黑才有地方恢复
+    let game_rel = relative_path
+        .split('/')
+        .next()
+        .unwrap_or(&relative_path)
+        .to_string();
+    let game_exists: Option<i64> = state.db.with(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT id FROM games WHERE repository_id=?1 AND relative_path=?2",
+                params![repository_id, game_rel],
+                |r| r.get(0),
+            )
+            .optional()?)
+    })?;
+    if game_exists.is_none() {
+        return Ok(UnblockOutcome {
+            restored: false,
+            message: "该档案当前处于删除状态；恢复档案后此版本会一并生效".into(),
+        });
+    }
+    Ok(try_restore(&state.db, repository_id, &game_rel))
+}
+
+/// 立即恢复一个游戏（单档案枚举 + 落库，走与「档案重扫」相同的保护规则）
+fn try_restore(db: &Db, repository_id: i64, game_rel: &str) -> UnblockOutcome {
+    match restore_inner(db, repository_id, game_rel) {
+        Ok(message) => UnblockOutcome {
+            restored: true,
+            message,
+        },
+        Err(message) => UnblockOutcome {
+            restored: false,
+            message,
+        },
+    }
+}
+
+fn restore_inner(db: &Db, repository_id: i64, game_rel: &str) -> Result<String, String> {
+    let root = resolve_repository(db, repository_id)
+        .map_err(|_| "仓库当前不可达，将在下次扫描时恢复".to_string())?;
+    if !join_rel(Path::new(&root), game_rel).is_dir() {
+        return Err("仓库中已找不到该目录，无法恢复".to_string());
+    }
+
+    let config = load_scan_config(db);
+    let (entry, _warnings) = scanner::scan_one_game(Path::new(&root), game_rel, &config);
+
+    let existing: Option<i64> = db
+        .with(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT id FROM games WHERE repository_id=?1 AND relative_path=?2",
+                    params![repository_id, game_rel],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        })
+        .map_err(|e| e.to_string())?;
+
+    match existing {
+        // 档案仍在（恢复某个版本）→ 只刷新该档案
+        Some(game_id) => store::apply_single(db, game_id, &entry)
+            .map(|_| "已恢复到档案".to_string())
+            .map_err(|e| format!("恢复失败：{e}")),
+        // 档案已被删除（恢复整个档案）→ 重新建档
+        None => store::apply_report(db, repository_id, std::slice::from_ref(&entry), false)
+            .map(|_| "已恢复到主页".to_string())
+            .map_err(|e| format!("恢复失败：{e}")),
+    }
 }
 
 // ---------------------------------------------------------------------------

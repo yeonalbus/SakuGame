@@ -9,6 +9,7 @@ import type {
   RepositoryRow,
   ScanProgress,
   ScanSummary,
+  UnblockOutcome,
 } from "./types";
 
 export const api = {
@@ -65,7 +66,7 @@ export const api = {
 
   // 黑名单
   listBlocklist: () => invoke<BlocklistRow[]>("list_blocklist"),
-  unblock: (blocklistId: number) => invoke<void>("unblock", { blocklistId }),
+  unblock: (blocklistId: number) => invoke<UnblockOutcome>("unblock", { blocklistId }),
 
   // 扫描
   startScan: (repositoryId: number) => invoke<number>("start_scan", { repositoryId }),

@@ -41,6 +41,45 @@ const warningTotal = computed(() => {
   return w.root_loose_files + w.truncated_with_version_dirs + w.enum_failed;
 });
 
+/** 黑名单收纳层：以档案为顶层折叠显示（"RJ123/" 仅作视觉归纳，不承担功能） */
+interface BlockGroup {
+  key: string;
+  firstAt: string;
+  items: BlocklistRow[];
+}
+
+const blockGroups = computed<BlockGroup[]>(() => {
+  const map = new Map<string, BlockGroup>();
+  for (const row of blocklist.value) {
+    const key =
+      row.kind === "game" ? row.relative_path : (row.relative_path.split("/")[0] ?? row.relative_path);
+    let group = map.get(key);
+    if (!group) {
+      group = { key, firstAt: row.created_at, items: [] };
+      map.set(key, group);
+    } else if (row.created_at < group.firstAt) {
+      group.firstAt = row.created_at;
+    }
+    group.items.push(row);
+  }
+  const groups = [...map.values()];
+  for (const group of groups) {
+    // 平铺层：档案在前、版本在后；同类按路径排序
+    group.items.sort((a, b) => {
+      if (a.kind !== b.kind) return a.kind === "game" ? -1 : 1;
+      return a.relative_path.localeCompare(b.relative_path);
+    });
+  }
+  // 收纳层：按拉黑顺序（最早的在前）
+  groups.sort((a, b) => a.firstAt.localeCompare(b.firstAt));
+  return groups;
+});
+
+function shortVersionName(path: string): string {
+  const parts = path.split("/");
+  return parts.length > 1 ? parts[parts.length - 1] : path;
+}
+
 async function loadRepos() {
   try {
     repos.value = await api.listRepositories();
@@ -107,9 +146,9 @@ async function cancel() {
 
 async function unblock(row: BlocklistRow) {
   try {
-    await api.unblock(row.id);
+    const outcome = await api.unblock(row.id);
     await loadBlocklist();
-    emit("toast", "已取消拉黑，下次扫描会重新纳入");
+    emit("toast", outcome.message, false);
   } catch (e) {
     emit("toast", errorText(e), true);
   }
@@ -344,17 +383,28 @@ onUnmounted(() => {
     <div v-else-if="tab === 'blocklist'">
       <div class="section">
         <h3>黑名单</h3>
-        <div class="faint" style="margin-bottom: 12px">
-          删除的档案与版本会保留在这里，避免下次扫描重复判定。取消拉黑后，下次扫描会重新纳入；
-          但不会恢复已丢弃的手填数据（名称 / 编号 / 封面 / 版本配置）。
+        <div class="faint" style="margin-bottom: 12px; line-height: 1.8">
+          删除的档案与版本会保留在这里，避免下次扫描重复判定。<br />
+          取消拉黑会<strong>立即恢复</strong>（档案 → 主页；版本 → 所属档案），不必等下一次扫描。<br />
+          但已丢弃的手填数据（名称 / 编号 / 封面 / 版本配置）不会恢复。
         </div>
-        <div v-for="row in blocklist" :key="row.id" class="block-row">
-          <span class="tag" :class="row.kind === 'game' ? 'ok' : ''">
-            {{ row.kind === "game" ? "档案" : "版本" }}
-          </span>
-          <span class="mono block-path">{{ row.relative_path }}</span>
-          <button @click="unblock(row)">取消拉黑</button>
+
+        <div v-for="g in blockGroups" :key="g.key" class="block-group">
+          <div class="block-group-head">
+            <span class="block-group-name">{{ g.key }}/</span>
+            <span class="faint">{{ g.items.length }} 条</span>
+          </div>
+          <div v-for="row in g.items" :key="row.id" class="block-row">
+            <span class="tag" :class="row.kind === 'game' ? 'ok' : ''">
+              {{ row.kind === "game" ? "档案" : "版本" }}
+            </span>
+            <span class="mono block-path" :title="row.relative_path">
+              {{ row.kind === "game" ? row.relative_path : shortVersionName(row.relative_path) }}
+            </span>
+            <button @click="unblock(row)">取消拉黑</button>
+          </div>
         </div>
+
         <div v-if="blocklist.length === 0" class="faint">黑名单为空</div>
       </div>
     </div>
