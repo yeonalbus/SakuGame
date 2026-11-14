@@ -100,13 +100,15 @@ pub fn check_repository(state: State<'_, AppState>, repository_id: i64) -> AppRe
 pub fn add_repository(state: State<'_, AppState>, payload: NewRepository) -> AppResult<i64> {
     validate_new_repository(&payload)?;
     let name = repository_display_name(&payload);
+    // 分配缓存池槽位号（最小可用号，删库后空号复用）
+    let slot = cache::alloc_slot(&state.db)?;
 
     state.db.with_mut(|conn| {
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO repositories(name, share_name, relative_root, created_at, is_offline)
-             VALUES(?1, ?2, ?3, ?4, 0)",
-            params![name, payload.share_name, payload.relative_root, Db::now()],
+            "INSERT INTO repositories(name, share_name, relative_root, created_at, is_offline, cache_slot)
+             VALUES(?1, ?2, ?3, ?4, 0, ?5)",
+            params![name, payload.share_name, payload.relative_root, Db::now(), slot],
         )?;
         let id = tx.last_insert_rowid();
         for loc in &payload.locators {
@@ -182,9 +184,18 @@ pub fn delete_repository(state: State<'_, AppState>, repository_id: i64) -> AppR
             "该仓库还有搬运任务，请先取消任务再删除".into(),
         ));
     }
-    // v2：连带清理该仓库在缓存池中的目录（R{id}）
-    if let Ok(pool) = cache::pool_root(db) {
-        let dir = cache::repo_dir(&pool, repository_id);
+    // v2：连带清理该仓库在缓存池中的目录（R{槽位号}）
+    let slot: Option<i64> = db.with(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT COALESCE(cache_slot, id) FROM repositories WHERE id=?1",
+                params![repository_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    })?;
+    if let (Some(slot), Ok(pool)) = (slot, cache::pool_root(db)) {
+        let dir = cache::repo_dir(&pool, slot);
         if dir.exists() {
             std::fs::remove_dir_all(scanner::extend_path(&dir))?;
         }

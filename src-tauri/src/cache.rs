@@ -201,14 +201,20 @@ pub struct VersionMeta {
     pub version_status: String,
     pub game_name: String,
     pub version_label: String,
+    /// 缓存池槽位号（repositories.cache_slot）
+    pub repo_slot: i64,
 }
 
 pub fn load_version_meta(db: &Db, version_id: i64) -> AppResult<VersionMeta> {
     db.with(|conn| {
         conn.query_row(
             "SELECT g.id, g.repository_id, g.relative_path, v.relative_path, v.game_type,
-                    g.layout, v.status, g.display_name, v.version_label
-             FROM game_versions v JOIN games g ON g.id = v.game_id WHERE v.id=?1",
+                    g.layout, v.status, g.display_name, v.version_label,
+                    COALESCE(r.cache_slot, r.id)
+             FROM game_versions v
+             JOIN games g ON g.id = v.game_id
+             JOIN repositories r ON r.id = g.repository_id
+             WHERE v.id=?1",
             params![version_id],
             |r| {
                 Ok(VersionMeta {
@@ -221,6 +227,7 @@ pub fn load_version_meta(db: &Db, version_id: i64) -> AppResult<VersionMeta> {
                     version_status: r.get(6)?,
                     game_name: r.get(7)?,
                     version_label: r.get(8)?,
+                    repo_slot: r.get(9)?,
                 })
             },
         )
@@ -285,9 +292,25 @@ pub fn is_cached(db: &Db, version_id: i64) -> AppResult<bool> {
 // 池内路径约定
 // ---------------------------------------------------------------------------
 
-/// 仓库编号：`R{id:02}`，不循环（id ≥ 100 自然三位）
-pub fn repo_no(id: i64) -> String {
-    format!("R{id:02}")
+/// 缓存池槽位号 → 目录名（`R01`），不循环；槽位号由 `alloc_slot` 分配
+pub fn repo_no(slot: i64) -> String {
+    format!("R{:02}", slot)
+}
+
+/// 分配最小可用槽位号（删库后空号复用，避免历史删除造成跳号）
+pub fn alloc_slot(db: &Db) -> AppResult<i64> {
+    db.with(|conn| {
+        let mut stmt =
+            conn.prepare("SELECT cache_slot FROM repositories WHERE cache_slot IS NOT NULL")?;
+        let it = stmt.query_map([], |r| r.get(0))?;
+        let mut used: Vec<i64> = it.filter_map(|r| r.ok()).collect();
+        used.sort_unstable();
+        let mut n = 1i64;
+        while used.contains(&n) {
+            n += 1;
+        }
+        Ok(n)
+    })
 }
 
 /// 池内相对路径（不含池根），见技术规格 §2.1
@@ -296,23 +319,23 @@ pub fn dest_rel(meta: &VersionMeta) -> String {
     if meta.layout == "compact" {
         format!(
             "{}/{}/{}",
-            repo_no(meta.repository_id),
+            repo_no(meta.repo_slot),
             game_layer,
             COMPACT_MARKER
         )
     } else {
         format!(
             "{}/{}/{}",
-            repo_no(meta.repository_id),
+            repo_no(meta.repo_slot),
             game_layer,
             last_segment(&meta.version_rel)
         )
     }
 }
 
-/// 仓库编号层目录（删仓库时整体清理）
-pub fn repo_dir(root: &Path, repository_id: i64) -> PathBuf {
-    root.join(repo_no(repository_id))
+/// 仓库槽位目录（删仓库时整体清理）
+pub fn repo_dir(root: &Path, repo_slot: i64) -> PathBuf {
+    root.join(repo_no(repo_slot))
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +563,7 @@ mod tests {
             version_status: "ok".into(),
             game_name: "game".into(),
             version_label: "St234567".into(),
+            repo_slot: 7,
         };
         assert_eq!(dest_rel(&meta), "R07/St234567/SakuCompact");
     }
@@ -556,6 +580,7 @@ mod tests {
             version_status: "ok".into(),
             game_name: "RJ123456".into(),
             version_label: "RJV1".into(),
+            repo_slot: 3,
         };
         assert_eq!(dest_rel(&meta), "R03/RJ123456/RJV1");
     }

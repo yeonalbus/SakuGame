@@ -37,6 +37,11 @@ impl Db {
         }
 
         conn.execute_batch(SCHEMA)?;
+        // v3 → v4：repositories 补 cache_slot 列（CREATE TABLE IF NOT EXISTS 不会给旧表加列）
+        if !table_has_column(&conn, "repositories", "cache_slot")? {
+            conn.execute("ALTER TABLE repositories ADD COLUMN cache_slot INTEGER", [])?;
+        }
+        backfill_cache_slots(&conn)?;
         conn.execute(
             "INSERT OR REPLACE INTO settings(key, value) VALUES('schema_version', ?1)",
             [SCHEMA_VERSION.to_string()],
@@ -86,7 +91,8 @@ impl Db {
 
 /// 当前 schema。所有表结构变更都必须追加版本号（见 settings.schema_version）。
 /// v2（MVP v2）：追加 transfer_tasks / cache_entries，不破坏 v1.1 既有表。
-pub const SCHEMA_VERSION: i32 = 3;
+/// v4：repositories 追加 cache_slot（缓存池槽位号，删库后空号可复用）。
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// 仓库根级目录排除名单默认值（JSON 数组；支持结尾 `*` 前缀通配，大小写不敏感）
 pub const DEFAULT_ROOT_EXCLUDED_DIRS: &str = r##"["#recycle","@eaDir","#snapshot","$RECYCLE.BIN","System Volume Information","lost+found",".Trash*",".DS_Store"]"##;
@@ -113,7 +119,8 @@ CREATE TABLE IF NOT EXISTS repositories (
     active_locator   TEXT,
     created_at       TEXT    NOT NULL,
     last_scan_at     TEXT,
-    is_offline       INTEGER NOT NULL DEFAULT 0
+    is_offline       INTEGER NOT NULL DEFAULT 0,
+    cache_slot       INTEGER
 );
 
 -- 仓库定位项（D16：盘符 / IP / 主机名三定位项并存，按可达性探测）
@@ -293,6 +300,35 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> AppResult<b
     Ok(cols.iter().any(|c| c.eq_ignore_ascii_case(column)))
 }
 
+/// 给缺 `cache_slot` 的仓库补号：按 id 顺序取最小可用槽位，避免历史删除造成跳号。
+fn backfill_cache_slots(conn: &Connection) -> AppResult<()> {
+    let ids: Vec<i64> = {
+        let mut stmt =
+            conn.prepare("SELECT id FROM repositories WHERE cache_slot IS NULL ORDER BY id")?;
+        let it = stmt.query_map([], |r| r.get(0))?;
+        it.filter_map(|r| r.ok()).collect()
+    };
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut used: Vec<i64> = {
+        let mut stmt =
+            conn.prepare("SELECT cache_slot FROM repositories WHERE cache_slot IS NOT NULL")?;
+        let it = stmt.query_map([], |r| r.get(0))?;
+        it.filter_map(|r| r.ok()).collect()
+    };
+    used.sort_unstable();
+    for id in ids {
+        let mut n = 1i64;
+        while used.contains(&n) {
+            n += 1;
+        }
+        conn.execute("UPDATE repositories SET cache_slot=?1 WHERE id=?2", [n, id])?;
+        used.push(n);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
@@ -352,7 +388,7 @@ mod tests {
         let (db, dir) = temp_db("meta");
         assert_eq!(
             db.get_setting("schema_version").unwrap().as_deref(),
-            Some("3")
+            Some("4")
         );
         let excluded = db.get_setting("root_excluded_dirs").unwrap().unwrap();
         assert!(excluded.contains("#recycle") && excluded.contains("@eaDir"));

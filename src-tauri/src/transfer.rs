@@ -142,7 +142,7 @@ pub fn start_transfer(
                 meta.repository_id,
                 meta.game_id,
                 version_id,
-                cache::repo_no(meta.repository_id),
+                cache::repo_no(meta.repo_slot),
                 meta.version_rel,
                 dest_rel,
                 total_bytes,
