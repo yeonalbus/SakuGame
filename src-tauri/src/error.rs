@@ -43,6 +43,43 @@ pub enum AppError {
     #[error("非法输入: {0}")]
     InvalidInput(String),
 
+    // ---- v2：缓存池 / 搬运 / 启动 ----
+    #[error("缓存池未配置，请先在设置中指定缓存池路径")]
+    CacheNotConfigured,
+
+    #[error("缓存池配额不足：需要 {required} 字节，可用 {available} 字节")]
+    QuotaExceeded { required: i64, available: i64 },
+
+    #[error("缓存池所在卷空间不足：需要 {required} 字节，可用 {available} 字节")]
+    DiskExceeded { required: i64, available: i64 },
+
+    #[error("搬运任务不存在: {0}")]
+    TransferNotFound(i64),
+
+    #[error("该版本已有搬运任务")]
+    TransferBusy,
+
+    #[error("该任务当前不可恢复（{0}）")]
+    TransferNotResumable(String),
+
+    #[error("该版本正在搬运中，请先取消任务")]
+    CacheRemoveBusy,
+
+    #[error("压缩包形态暂不支持搬运，请先在仓库中解压后重扫")]
+    ArchiveUnsupported,
+
+    #[error("缓存池路径不得设在任何仓库根之内")]
+    PoolPathInsideRepository,
+
+    #[error("已有缓存或搬运任务，缓存池路径已锁定；请先清空缓存池")]
+    CachePathLocked,
+
+    #[error("该版本尚未配置启动项")]
+    LaunchNoExecutable,
+
+    #[error("启动失败: {0}")]
+    LaunchFailed(String),
+
     #[error("内部错误: {0}")]
     Internal(String),
 }
@@ -68,6 +105,18 @@ impl Serialize for AppError {
             AppError::NoActiveScan => "no_active_scan",
             AppError::RepositoryUnreachable => "repository_unreachable",
             AppError::InvalidInput(_) => "invalid_input",
+            AppError::CacheNotConfigured => "cache_not_configured",
+            AppError::QuotaExceeded { .. } => "quota_exceeded",
+            AppError::DiskExceeded { .. } => "disk_exceeded",
+            AppError::TransferNotFound(_) => "transfer_not_found",
+            AppError::TransferBusy => "transfer_busy",
+            AppError::TransferNotResumable(_) => "transfer_not_resumable",
+            AppError::CacheRemoveBusy => "cache_remove_busy",
+            AppError::ArchiveUnsupported => "archive_unsupported",
+            AppError::PoolPathInsideRepository => "pool_path_inside_repository",
+            AppError::CachePathLocked => "cache_path_locked",
+            AppError::LaunchNoExecutable => "launch_no_executable",
+            AppError::LaunchFailed(_) => "launch_failed",
             AppError::Internal(_) => "internal",
         };
         let mut s = serializer.serialize_struct("AppError", 2)?;

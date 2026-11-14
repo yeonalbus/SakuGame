@@ -8,17 +8,20 @@ use std::time::{Duration, Instant};
 use rusqlite::{params, Connection, OptionalExtension};
 use tauri::{AppHandle, Emitter, State};
 
+use crate::cache;
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
 use crate::locator;
 use crate::models::{
-    BlocklistRow, ExecutableRow, ExeCandidate, GameDetail, GameRow, GameVersionRow, LocatorKind,
-    NewRepository, RepositoryLocator, RepositoryRow, ScanPhase, ScanProgress, ScanScope,
-    ScanSummary, UnblockOutcome,
+    BlocklistRow, CacheConfig, CacheUsage, ExecutableRow, ExeCandidate, GameDetail, GameRow,
+    GameVersionRow, LocatorKind, NewRepository, RepositoryDeletePreview, RepositoryLocator,
+    RepositoryRow, ScanPhase, ScanProgress, ScanScope, ScanSummary, TransferPreflight,
+    TransferTaskView, UnblockOutcome, VersionState,
 };
 use crate::scanner::{self, ScanConfig, ScanControl};
 use crate::state::{ActiveScan, AppState, ScanSlot};
 use crate::store;
+use crate::transfer;
 
 // ---------------------------------------------------------------------------
 // 仓库
@@ -164,7 +167,29 @@ pub fn delete_repository(state: State<'_, AppState>, repository_id: i64) -> AppR
     if is_scanning(&state) {
         return Err(AppError::ScanInProgress);
     }
-    state.db.with(|conn| {
+    let db = &state.db;
+    // v2：有在途搬运任务时拒绝（否则任务会往正在被删的路径里写）
+    let active: i64 = db.with(|conn| {
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM transfer_tasks WHERE repository_id=?1
+             AND status IN ('queued','running','paused')",
+            params![repository_id],
+            |r| r.get(0),
+        )?)
+    })?;
+    if active > 0 {
+        return Err(AppError::InvalidInput(
+            "该仓库还有搬运任务，请先取消任务再删除".into(),
+        ));
+    }
+    // v2：连带清理该仓库在缓存池中的目录（R{id}）
+    if let Ok(pool) = cache::pool_root(db) {
+        let dir = cache::repo_dir(&pool, repository_id);
+        if dir.exists() {
+            std::fs::remove_dir_all(scanner::extend_path(&dir))?;
+        }
+    }
+    db.with(|conn| {
         // 档案随仓库级联删除（O5）
         let affected = conn.execute(
             "DELETE FROM repositories WHERE id=?1",
@@ -1475,4 +1500,261 @@ fn is_scanning(state: &State<'_, AppState>) -> bool {
         .lock()
         .map(|g| g.active.is_some())
         .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// 缓存池（v2）
+// 依据：DSPlans/Specs/MVPv2技术规格.md §5 / §11
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn get_cache_config(state: State<'_, AppState>) -> AppResult<(CacheConfig, CacheUsage)> {
+    let db = &state.db;
+    let cfg = cache::load_config(db)?;
+    let usage = cache::usage(db)?;
+    Ok((cfg, usage))
+}
+
+#[tauri::command]
+pub fn set_cache_config(
+    state: State<'_, AppState>,
+    root: Option<String>,
+    quota_bytes: i64,
+) -> AppResult<()> {
+    cache::save_config(&state.db, root.as_deref(), quota_bytes)
+}
+
+#[tauri::command]
+pub fn get_cache_usage(state: State<'_, AppState>) -> AppResult<CacheUsage> {
+    cache::usage(&state.db)
+}
+
+/// 点搬运前的即时判（纯读，不预留）
+#[tauri::command]
+pub fn preflight_transfer(
+    state: State<'_, AppState>,
+    version_id: i64,
+) -> AppResult<TransferPreflight> {
+    let db = &state.db;
+    let meta = cache::load_version_meta(db, version_id)?;
+    let root = resolve_repository(db, meta.repository_id)?;
+    cache::preflight(db, version_id, Path::new(&root))
+}
+
+// ---------------------------------------------------------------------------
+// 搬运（v2）
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn start_transfer(state: State<'_, AppState>, version_id: i64) -> AppResult<i64> {
+    let db = &state.db;
+    let meta = cache::load_version_meta(db, version_id)?;
+    let root = resolve_repository(db, meta.repository_id)?;
+    transfer::start_transfer(&state.transfer, Path::new(&root), version_id)
+}
+
+#[tauri::command]
+pub fn list_transfers(state: State<'_, AppState>) -> AppResult<Vec<TransferTaskView>> {
+    transfer::list_tasks(&state.db)
+}
+
+/// 详情页按钮态：该版本当前的任务（排队/搬运/暂停/出错）
+#[tauri::command]
+pub fn get_version_transfer(
+    state: State<'_, AppState>,
+    version_id: i64,
+) -> AppResult<Option<TransferTaskView>> {
+    let db = &state.db;
+    let task_id: Option<i64> = db.with(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT id FROM transfer_tasks WHERE version_id=?1
+                 AND status IN ('queued','running','paused','error') ORDER BY id DESC LIMIT 1",
+                params![version_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    })?;
+    Ok(task_id.and_then(|id| transfer::task_view(db, id)))
+}
+
+#[tauri::command]
+pub fn pause_transfer(state: State<'_, AppState>, task_id: i64) -> AppResult<()> {
+    transfer::pause_task(&state.transfer, task_id)
+}
+
+#[tauri::command]
+pub fn resume_transfer(state: State<'_, AppState>, task_id: i64) -> AppResult<()> {
+    transfer::resume_task(&state.transfer, task_id)
+}
+
+#[tauri::command]
+pub fn cancel_transfer(state: State<'_, AppState>, task_id: i64) -> AppResult<()> {
+    transfer::cancel_task(&state.transfer, task_id)
+}
+
+#[tauri::command]
+pub fn retry_transfer(state: State<'_, AppState>, task_id: i64) -> AppResult<i64> {
+    transfer::retry_task(&state.transfer, task_id)
+}
+
+/// 从缓存池移除（只删池内副本）
+#[tauri::command]
+pub fn remove_cache(state: State<'_, AppState>, version_id: i64) -> AppResult<()> {
+    cache::remove_cache(&state.db, version_id)
+}
+
+/// 详情页按钮态机：一次拿该档案下所有版本的缓存与任务状态
+#[tauri::command]
+pub fn get_version_states(
+    state: State<'_, AppState>,
+    game_id: i64,
+) -> AppResult<Vec<VersionState>> {
+    let db = &state.db;
+    // 先在一个 with 里收集原始状态（避免在持锁闭包内再调 task_view 造成重入死锁）
+    let raw: Vec<(i64, Option<String>, Option<i64>)> = db.with(|conn| {
+        let mut stmt =
+            conn.prepare("SELECT id FROM game_versions WHERE game_id=?1 ORDER BY id ASC")?;
+        let ids: Vec<i64> = stmt
+            .query_map(params![game_id], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut out = Vec::with_capacity(ids.len());
+        for vid in ids {
+            let cache: Option<String> = conn
+                .query_row(
+                    "SELECT status FROM cache_entries WHERE version_id=?1",
+                    params![vid],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let task_id: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM transfer_tasks WHERE version_id=?1
+                     AND status IN ('queued','running','paused','error')
+                     ORDER BY id DESC LIMIT 1",
+                    params![vid],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            out.push((vid, cache, task_id));
+        }
+        Ok(out)
+    })?;
+
+    let mut out = Vec::with_capacity(raw.len());
+    for (vid, cache, task_id) in raw {
+        out.push(VersionState {
+            version_id: vid,
+            cached: cache.as_deref() == Some("ok"),
+            cache_missing: cache.as_deref() == Some("missing"),
+            task: task_id.and_then(|t| transfer::task_view(db, t)),
+        });
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// 启动（v2）
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn launch_game(state: State<'_, AppState>, game_id: i64) -> AppResult<()> {
+    let db = &state.db;
+    let version_id = selected_version_id(db, game_id)?.ok_or(AppError::LaunchNoExecutable)?;
+
+    let exe_rel: Option<String> = db.with(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT relative_path FROM game_version_executables
+                 WHERE version_id=?1 AND is_selected=1 AND invalid=0",
+                params![version_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    })?;
+    let exe_rel = exe_rel.ok_or(AppError::LaunchNoExecutable)?;
+
+    let mapped: Option<(String, String)> = db.with(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT v.relative_path, c.dest_rel FROM game_versions v
+                 JOIN cache_entries c ON c.version_id = v.id
+                 WHERE v.id=?1 AND c.status='ok'",
+                params![version_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?)
+    })?;
+    let (version_rel, dest_rel) =
+        mapped.ok_or_else(|| AppError::LaunchFailed("该版本尚未缓存，请先搬运".into()))?;
+
+    let pool = cache::pool_root(db)?;
+    let prefix = format!("{}/", version_rel.trim_end_matches('/'));
+    let suffix = exe_rel.strip_prefix(&prefix).unwrap_or(&exe_rel);
+    let exe_abs = cache::join_rel(&pool, &dest_rel).join(suffix.replace('/', "\\"));
+
+    let abs_str = exe_abs.to_string_lossy().to_string();
+    if abs_str.chars().count() > 260 {
+        return Err(AppError::LaunchFailed(
+            "可执行文件路径超过系统 260 字符限制，游戏可能无法启动".into(),
+        ));
+    }
+    if !exe_abs.exists() {
+        return Err(AppError::LaunchFailed(
+            "可执行文件不存在，缓存可能已被清理".into(),
+        ));
+    }
+    let dir = exe_abs.parent().map(|p| p.to_path_buf()).unwrap_or(pool);
+    std::process::Command::new(&exe_abs)
+        .current_dir(&dir)
+        .spawn()
+        .map_err(|e| AppError::LaunchFailed(e.to_string()))?;
+    Ok(())
+}
+
+fn selected_version_id(db: &Db, game_id: i64) -> AppResult<Option<i64>> {
+    db.with(|conn| {
+        let v: Option<Option<i64>> = conn
+            .query_row(
+                "SELECT selected_version_id FROM games WHERE id=?1",
+                params![game_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match v {
+            None => Err(AppError::GameNotFound(game_id)),
+            Some(inner) => Ok(inner),
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 仓库删除预览（v2）
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn get_repository_delete_preview(
+    state: State<'_, AppState>,
+    repository_id: i64,
+) -> AppResult<RepositoryDeletePreview> {
+    state.db.with(|conn| {
+        let (cache_count, cache_bytes): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM cache_entries
+             WHERE repository_id=?1 AND status='ok'",
+            params![repository_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let active: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM transfer_tasks WHERE repository_id=?1
+             AND status IN ('queued','running','paused')",
+            params![repository_id],
+            |r| r.get(0),
+        )?;
+        Ok(RepositoryDeletePreview {
+            cache_count,
+            cache_bytes,
+            active_task_count: active,
+        })
+    })
 }

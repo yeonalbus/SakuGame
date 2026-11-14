@@ -5,18 +5,24 @@ use std::sync::{Arc, Mutex};
 use crate::db::Db;
 use crate::models::ScanProgress;
 use crate::scanner::ScanControl;
+use crate::transfer::TransferEngine;
 
 pub struct AppState {
     pub db: Arc<Db>,
     /// 扫描槽：需要被扫描线程共享，故为 Arc<Mutex<_>>
     pub scan: Arc<Mutex<ScanSlot>>,
+    /// 搬运机（v2）
+    pub transfer: Arc<TransferEngine>,
 }
 
 impl AppState {
     pub fn new(db: Db) -> Self {
+        let db = Arc::new(db);
+        let transfer = Arc::new(TransferEngine::new(db.clone()));
         AppState {
-            db: Arc::new(db),
+            db,
             scan: Arc::new(Mutex::new(ScanSlot::default())),
+            transfer,
         }
     }
 }

@@ -84,8 +84,9 @@ impl Db {
     }
 }
 
-/// v1.1 schema。所有表结构变更都必须追加版本号（见 settings.schema_version）。
-pub const SCHEMA_VERSION: i32 = 2;
+/// 当前 schema。所有表结构变更都必须追加版本号（见 settings.schema_version）。
+/// v2（MVP v2）：追加 transfer_tasks / cache_entries，不破坏 v1.1 既有表。
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// 仓库根级目录排除名单默认值（JSON 数组；支持结尾 `*` 前缀通配，大小写不敏感）
 pub const DEFAULT_ROOT_EXCLUDED_DIRS: &str = r##"["#recycle","@eaDir","#snapshot","$RECYCLE.BIN","System Volume Information","lost+found",".Trash*",".DS_Store"]"##;
@@ -221,12 +222,57 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 
+-- 搬运任务（v2；持久化以支撑队列重建与崩溃恢复）
+CREATE TABLE IF NOT EXISTS transfer_tasks (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    repository_id  INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    game_id        INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+    version_id     INTEGER NOT NULL REFERENCES game_versions(id) ON DELETE CASCADE,
+    repo_no        TEXT    NOT NULL,
+    source_rel     TEXT    NOT NULL,
+    dest_rel       TEXT    NOT NULL,
+    total_bytes    INTEGER NOT NULL,
+    total_files    INTEGER NOT NULL,
+    written_bytes  INTEGER NOT NULL DEFAULT 0,
+    written_files  INTEGER NOT NULL DEFAULT 0,
+    concurrency    INTEGER NOT NULL,
+    status         TEXT    NOT NULL DEFAULT 'queued'
+                   CHECK (status IN ('queued','running','paused','error','done','cancelled')),
+    error_message  TEXT,
+    failed_files   TEXT,
+    created_at     TEXT    NOT NULL,
+    started_at     TEXT,
+    finished_at    TEXT,
+    updated_at     TEXT    NOT NULL
+);
+
+-- 缓存记录（v2；已完成搬运的落点，对账用）
+CREATE TABLE IF NOT EXISTS cache_entries (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    repository_id    INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    game_id          INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+    version_id       INTEGER NOT NULL REFERENCES game_versions(id) ON DELETE CASCADE,
+    repo_no          TEXT    NOT NULL,
+    dest_rel         TEXT    NOT NULL,
+    size_bytes       INTEGER NOT NULL,
+    file_count       INTEGER NOT NULL,
+    status           TEXT    NOT NULL DEFAULT 'ok' CHECK (status IN ('ok','missing')),
+    created_at       TEXT    NOT NULL,
+    last_verified_at TEXT,
+    UNIQUE (version_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_games_repo_status  ON games(repository_id, status);
 CREATE INDEX IF NOT EXISTS idx_games_display_name ON games(display_name);
 CREATE INDEX IF NOT EXISTS idx_versions_game      ON game_versions(game_id);
 CREATE INDEX IF NOT EXISTS idx_exes_version       ON game_version_executables(version_id);
 CREATE INDEX IF NOT EXISTS idx_vfiles_version     ON game_version_files(version_id);
 CREATE INDEX IF NOT EXISTS idx_blocklist_repo     ON blocklist(repository_id, kind);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_transfer_active
+    ON transfer_tasks(version_id) WHERE status IN ('queued','running','paused');
+CREATE INDEX IF NOT EXISTS idx_transfer_state   ON transfer_tasks(status);
+CREATE INDEX IF NOT EXISTS idx_cache_repo       ON cache_entries(repository_id, status);
+CREATE INDEX IF NOT EXISTS idx_cache_version    ON cache_entries(version_id);
 "#;
 
 fn table_exists(conn: &Connection, name: &str) -> AppResult<bool> {
@@ -306,7 +352,7 @@ mod tests {
         let (db, dir) = temp_db("meta");
         assert_eq!(
             db.get_setting("schema_version").unwrap().as_deref(),
-            Some("2")
+            Some("3")
         );
         let excluded = db.get_setting("root_excluded_dirs").unwrap().unwrap();
         assert!(excluded.contains("#recycle") && excluded.contains("@eaDir"));

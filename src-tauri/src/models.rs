@@ -407,3 +407,148 @@ pub struct ScanSummary {
     pub enum_failed: u32,
     pub scope: ScanScope,
 }
+
+// ---------------------------------------------------------------------------
+// 缓存池 / 搬运（v2）
+// 依据：DSPlans/Specs/MVPv2技术规格.md §3
+// ---------------------------------------------------------------------------
+
+/// 缓存池配置（持久化在 settings 表）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheConfig {
+    /// 绝对路径；None = 未配置
+    pub root: Option<String>,
+    /// 逻辑配额（字节），不预分配磁盘
+    pub quota_bytes: i64,
+}
+
+/// 容量快照：前端展示 + 预检计算共用
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheUsage {
+    pub quota_bytes: i64,
+    /// 已完成缓存 + 在途任务（含预留）
+    pub used_bytes: i64,
+    /// quota - used（可为负）
+    pub free_bytes: i64,
+    /// 池所在卷总容量
+    pub disk_total_bytes: i64,
+    /// 池所在卷剩余
+    pub disk_free_bytes: i64,
+    /// disk_total * 10%
+    pub safety_bytes: i64,
+    /// disk_free - safety（可为负）
+    pub available_bytes: i64,
+}
+
+/// 搬运任务状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferStatus {
+    Queued,
+    Running,
+    Paused,
+    Error,
+    Done,
+}
+
+impl TransferStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TransferStatus::Queued => "queued",
+            TransferStatus::Running => "running",
+            TransferStatus::Paused => "paused",
+            TransferStatus::Error => "error",
+            TransferStatus::Done => "done",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "queued" => Some(TransferStatus::Queued),
+            "running" => Some(TransferStatus::Running),
+            "paused" => Some(TransferStatus::Paused),
+            "error" => Some(TransferStatus::Error),
+            "done" => Some(TransferStatus::Done),
+            _ => None,
+        }
+    }
+}
+
+/// 预检不通过的原因
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreflightReason {
+    PoolNotConfigured,
+    InvalidVersion,
+    ArchiveUnsupported,
+    AlreadyCached,
+    QuotaExceeded,
+    DiskExceeded,
+}
+
+/// 预检结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferPreflight {
+    pub ok: bool,
+    pub reason: Option<PreflightReason>,
+    /// 本次要搬的字节（递归求和）
+    pub required_bytes: i64,
+    /// 配额余量（quota - used）
+    pub available_quota_bytes: i64,
+    /// 物理可用（disk_free - safety）
+    pub available_disk_bytes: i64,
+}
+
+/// 任务视图（IPC 返回）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferTaskView {
+    pub task_id: i64,
+    pub repository_id: i64,
+    pub game_id: i64,
+    pub version_id: i64,
+    /// 仓库编号快照（如 R01）
+    pub repo_no: String,
+    pub game_name: String,
+    pub version_label: String,
+    pub total_bytes: i64,
+    pub written_bytes: i64,
+    pub total_files: i64,
+    pub written_files: i64,
+    pub status: TransferStatus,
+    /// 最近 10s 速率
+    pub speed_bps: i64,
+    pub eta_secs: Option<i64>,
+    pub error: Option<String>,
+    pub failed_files: Vec<String>,
+}
+
+/// 进度事件负载（节流 200ms）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferProgressEvent {
+    pub task_id: i64,
+    pub written_bytes: i64,
+    pub total_bytes: i64,
+    pub speed_bps: i64,
+    pub eta_secs: Option<i64>,
+    pub status: TransferStatus,
+}
+
+/// 删除仓库前的预览（前端二次确认用）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepositoryDeletePreview {
+    pub cache_count: i64,
+    pub cache_bytes: i64,
+    pub active_task_count: i64,
+}
+
+/// 单个版本的缓存/搬运运行时状态（详情页按钮态机用）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionState {
+    pub version_id: i64,
+    /// 已完成缓存（cache_entries.status = ok）
+    pub cached: bool,
+    /// 记录在但池内目录已失效
+    pub cache_missing: bool,
+    /// 当前任务（排队/搬运/暂停/出错）
+    pub task: Option<TransferTaskView>,
+}

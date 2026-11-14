@@ -1,4 +1,5 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+pub mod cache;
 pub mod commands;
 pub mod db;
 pub mod error;
@@ -7,6 +8,7 @@ pub mod models;
 pub mod scanner;
 pub mod state;
 pub mod store;
+pub mod transfer;
 
 use tauri::Manager;
 
@@ -19,7 +21,13 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
             let db = db::Db::open(&data_dir.join("sakugame.db"))?;
-            app.manage(state::AppState::new(db));
+            // v2：启动对账（缓存记录 vs 池内目录）+ 未完成任务转暂停
+            let _ = cache::reconcile(&db);
+            let _ = transfer::recover_on_startup(&db);
+            let state = state::AppState::new(db);
+            let engine = state.transfer.clone();
+            app.manage(state);
+            transfer::spawn_scheduler(engine, app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -47,6 +55,21 @@ pub fn run() {
             commands::resume_scan,
             commands::cancel_scan,
             commands::scan_status,
+            commands::get_cache_config,
+            commands::set_cache_config,
+            commands::get_cache_usage,
+            commands::preflight_transfer,
+            commands::start_transfer,
+            commands::list_transfers,
+            commands::get_version_transfer,
+            commands::pause_transfer,
+            commands::resume_transfer,
+            commands::cancel_transfer,
+            commands::retry_transfer,
+            commands::remove_cache,
+            commands::get_version_states,
+            commands::launch_game,
+            commands::get_repository_delete_preview,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
