@@ -385,7 +385,7 @@ fn classify_game(
 
     // ---- 紧凑型：游戏标识层自身直接含 exe / 压缩包 → 截断，1 个版本 ----
     if !direct_exes.is_empty() || !direct_archives.is_empty() {
-        let size: u64 = entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
+        let size = dir_size_total(&entries);
         let version = VersionEntry {
             relative_path: rel.to_string(),
             version_label: display_name.clone(),
@@ -434,7 +434,7 @@ fn classify_game(
             // 对象定义：版本标识层下必须存在可执行文件或压缩包，且不能在子目录中
             continue;
         }
-        let size: u64 = sub_entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
+        let size = dir_size_total(&sub_entries);
         versions.push(VersionEntry {
             relative_path: sub_rel,
             version_label: sub.name.clone(),
@@ -536,6 +536,39 @@ struct DirEntry {
     is_dir: bool,
     reparse: bool,
     size: u64,
+}
+
+/// 版本目录的真实大小：直接文件 + 递归子目录。
+/// 与搬运时的递归求和对齐（否则详情页显示的大小会远小于实际搬运量）。
+/// 失败项跳过，不中断扫描。
+fn dir_size_total(entries: &[DirEntry]) -> u64 {
+    let direct: u64 = entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
+    let sub: u64 = entries
+        .iter()
+        .filter(|e| e.is_dir && !e.reparse)
+        .map(|e| dir_size_recursive(&e.path))
+        .sum();
+    direct + sub
+}
+
+fn dir_size_recursive(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(items) = list_dir(&extend_path(&d)) else {
+            continue;
+        };
+        for e in items {
+            if e.is_dir {
+                if !e.reparse {
+                    stack.push(e.path);
+                }
+            } else {
+                total += e.size;
+            }
+        }
+    }
+    total
 }
 
 fn list_dir(dir: &Path) -> std::io::Result<Vec<DirEntry>> {
