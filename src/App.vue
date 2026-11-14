@@ -4,6 +4,7 @@ import Sidebar from "./components/Sidebar.vue";
 import ConfirmDialog from "./components/ConfirmDialog.vue";
 import HomeView from "./views/HomeView.vue";
 import GameDetailView from "./views/GameDetailView.vue";
+import TransferView from "./views/TransferView.vue";
 import SettingsView from "./views/SettingsView.vue";
 import type { ViewKey } from "./types";
 
@@ -34,7 +35,7 @@ function openGame(id: number) {
 <template>
   <div class="app">
     <Sidebar
-      :active="view === 'settings' ? 'settings' : 'home'"
+      :active="view === 'detail' ? 'home' : view"
       @navigate="navigate"
     />
 
@@ -47,6 +48,11 @@ function openGame(id: number) {
         v-else-if="view === 'detail' && selectedGameId !== null"
         :game-id="selectedGameId"
         @back="navigate('home')"
+        @toast="showToast"
+      />
+      <TransferView
+        v-else-if="view === 'transfer'"
+        @open="openGame"
         @toast="showToast"
       />
       <SettingsView v-else-if="view === 'settings'" @toast="showToast" />

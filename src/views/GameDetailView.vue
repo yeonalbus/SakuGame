@@ -3,9 +3,16 @@ import { ref, computed, onMounted, onUnmounted } from "vue";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { api, errorText, formatBytes, onScanFinished } from "../api";
+import { api, errorText, formatBytes, onScanFinished, onTransferProgress, onTransferState } from "../api";
 import { askConfirm } from "../confirm";
-import type { ExeCandidate, ExecutableRow, GameDetail, GameVersionRow } from "../types";
+import type {
+  ExeCandidate,
+  ExecutableRow,
+  GameDetail,
+  GameVersionRow,
+  TransferProgressEvent,
+  VersionState,
+} from "../types";
 
 const props = defineProps<{ gameId: number }>();
 const emit = defineEmits<{ back: []; toast: [text: string, error?: boolean] }>();
@@ -37,6 +44,13 @@ const manualSelected = ref<string | null>(null);
 const manualBusy = ref(false);
 
 let unlisten: UnlistenFn | null = null;
+let unProgress: UnlistenFn | null = null;
+let unState: UnlistenFn | null = null;
+
+// v2：缓存 / 搬运态
+const versionStates = ref<Record<number, VersionState>>({});
+const liveProgress = ref<Record<number, TransferProgressEvent>>({});
+const transferBusy = ref(false);
 
 const versions = computed(() => detail.value?.versions ?? []);
 const currentVersion = computed(
@@ -48,15 +62,79 @@ function hasLaunchItem(v: GameVersionRow) {
   return v.executables.some((e) => e.is_selected);
 }
 
-/** 启动列表只列出「已选择启动项」的版本；未配置启动项的版本不出现 */
+/** 启动列表只列出「已选择启动项」的版本 */
 const launchableVersions = computed(() => versions.value.filter(hasLaunchItem));
-const canLaunch = computed(
-  () => currentVersion.value !== null && hasLaunchItem(currentVersion.value),
+
+/** 当前版本的运行时状态 */
+const currentState = computed(() =>
+  currentVersion.value ? (versionStates.value[currentVersion.value.id] ?? null) : null,
 );
-const launchLabel = computed(() => {
-  if (!currentVersion.value) return "无可用版本";
-  if (!canLaunch.value) return "未配置启动项";
-  return `启动：${currentVersion.value.display_name}`;
+const currentTask = computed(() => currentState.value?.task ?? null);
+
+/** 按钮态机（技术规格 §12.1） */
+type BtnMode =
+  | "none"
+  | "archive"
+  | "queued"
+  | "running"
+  | "paused"
+  | "error"
+  | "transfer"
+  | "launch"
+  | "config";
+const btnMode = computed<BtnMode>(() => {
+  const v = currentVersion.value;
+  if (!v) return "none";
+  if (v.game_type === "archive") return "archive";
+  const task = currentTask.value;
+  if (task) {
+    if (task.status === "queued") return "queued";
+    if (task.status === "running") return "running";
+    if (task.status === "paused") return "paused";
+    if (task.status === "error") return "error";
+  }
+  if (currentState.value?.cached) return hasLaunchItem(v) ? "launch" : "config";
+  return "transfer";
+});
+
+const btnLabel = computed(() => {
+  const v = currentVersion.value;
+  if (!v) return "无可用版本";
+  switch (btnMode.value) {
+    case "archive":
+      return "未就绪，请解压后重扫";
+    case "queued":
+      return "排队中…";
+    case "running":
+      return "搬运中…";
+    case "paused":
+      return "已暂停";
+    case "error":
+      return "重试搬运";
+    case "transfer":
+      return `搬运：${v.display_name}`;
+    case "launch":
+      return `启动：${v.display_name}`;
+    case "config":
+      return "配置启动项";
+    default:
+      return "未配置启动项";
+  }
+});
+
+const btnDisabled = computed(
+  () => btnMode.value === "none" || btnMode.value === "queued" || btnMode.value === "archive",
+);
+
+/** 详情页小进度条（事件优先，任务行兜底） */
+const currentProgress = computed(() => {
+  const task = currentTask.value;
+  if (!task) return null;
+  const ev = liveProgress.value[task.task_id];
+  const written = ev?.written_bytes ?? task.written_bytes;
+  const total = ev?.total_bytes ?? task.total_bytes;
+  const pct = total > 0 ? Math.min(100, (written / total) * 100) : 0;
+  return { written, total, pct, speed: ev?.speed_bps ?? 0 };
 });
 
 const coverSrc = computed(() => {
@@ -90,6 +168,18 @@ async function load() {
     }
     nameDrafts.value = names;
     noteDrafts.value = notes;
+    await loadStates();
+  } catch (e) {
+    emit("toast", errorText(e), true);
+  }
+}
+
+async function loadStates() {
+  try {
+    const states = await api.getVersionStates(props.gameId);
+    const map: Record<number, VersionState> = {};
+    for (const s of states) map[s.version_id] = s;
+    versionStates.value = map;
   } catch (e) {
     emit("toast", errorText(e), true);
   }
@@ -172,10 +262,104 @@ async function pickCover() {
   }
 }
 
-// ---- 启动按钮（v1.1 仅占位） ----
+// ---- 启动按钮（v2：搬运 / 启动 / 暂停 / 恢复 / 重试） ----
 
-function notImplemented() {
-  emit("toast", "项目尚未实现启动功能，等待 mvp v2 完善");
+function preflightText(reason: string | null) {
+  switch (reason) {
+    case "pool_not_configured":
+      return "缓存池未配置，请先到设置中配置";
+    case "quota_exceeded":
+      return "缓存池配额不足，请扩容或清理";
+    case "disk_exceeded":
+      return "缓存池所在磁盘空间不足";
+    case "archive_unsupported":
+      return "压缩包形态暂不支持搬运";
+    case "already_cached":
+      return "该版本已在缓存池中";
+    default:
+      return "无法搬运该版本";
+  }
+}
+
+async function onMainButton() {
+  const v = currentVersion.value;
+  if (!v || transferBusy.value) return;
+  switch (btnMode.value) {
+    case "launch":
+      try {
+        await api.launchGame(props.gameId);
+      } catch (e) {
+        emit("toast", errorText(e), true);
+      }
+      return;
+    case "config":
+      activeTab.value = "versions";
+      if (!expanded.value.includes(v.id)) expanded.value = [...expanded.value, v.id];
+      emit("toast", "请在版本条目中选择启动项");
+      return;
+    case "transfer": {
+      transferBusy.value = true;
+      try {
+        const pf = await api.preflightTransfer(v.id);
+        if (!pf.ok) {
+          emit("toast", preflightText(pf.reason), true);
+          return;
+        }
+        await api.startTransfer(v.id);
+        emit("toast", "已开始搬运");
+        await loadStates();
+      } catch (e) {
+        emit("toast", errorText(e), true);
+      } finally {
+        transferBusy.value = false;
+      }
+      return;
+    }
+    case "paused":
+    case "error":
+    case "running": {
+      const task = currentTask.value;
+      if (!task) return;
+      try {
+        if (btnMode.value === "paused") await api.resumeTransfer(task.task_id);
+        else if (btnMode.value === "error") await api.retryTransfer(task.task_id);
+        else await api.pauseTransfer(task.task_id);
+        await loadStates();
+      } catch (e) {
+        emit("toast", errorText(e), true);
+      }
+      return;
+    }
+  }
+}
+
+async function cancelCurrent() {
+  const task = currentTask.value;
+  if (!task) return;
+  try {
+    await api.cancelTransfer(task.task_id);
+    emit("toast", "已取消搬运");
+    await loadStates();
+  } catch (e) {
+    emit("toast", errorText(e), true);
+  }
+}
+
+async function removeCacheOf(v: GameVersionRow) {
+  const ok = await askConfirm(
+    "从缓存池移除",
+    `将删除版本「${v.display_name}」在缓存池中的副本。\n\n` +
+      `仓库中的文件不受影响；池内产生的改动会被丢弃（回写属 V2.1 变更组功能）。`,
+    { confirmText: "移除", danger: true },
+  );
+  if (!ok) return;
+  try {
+    await api.removeCache(v.id);
+    await loadStates();
+    emit("toast", "已从缓存池移除");
+  } catch (e) {
+    emit("toast", errorText(e), true);
+  }
 }
 
 async function selectVersion(v: GameVersionRow) {
@@ -336,10 +520,20 @@ onMounted(async () => {
       emit("toast", `重扫完成：新增 ${s.added}，更新 ${s.updated}，缺失 ${s.missing}`);
     }
   });
+  unProgress = await onTransferProgress((p) => {
+    liveProgress.value[p.task_id] = p;
+    const task = currentTask.value;
+    if (task && task.task_id === p.task_id && task.status !== p.status) void loadStates();
+  });
+  unState = await onTransferState(() => {
+    void loadStates();
+  });
 });
 
 onUnmounted(() => {
   unlisten?.();
+  unProgress?.();
+  unState?.();
 });
 </script>
 
@@ -395,17 +589,41 @@ onUnmounted(() => {
 
         <div class="launch-wrap">
           <div class="launch">
-            <button class="launch-main" :disabled="!canLaunch" @click="notImplemented">
-              {{ launchLabel }}
+            <button class="launch-main" :disabled="btnDisabled" @click="onMainButton">
+              {{ btnLabel }}
             </button>
             <button
               class="launch-caret"
-              :disabled="!canLaunch"
+              :disabled="versions.length === 0"
               title="选择版本"
               @click="pickerOpen = !pickerOpen"
             >
               ▾
             </button>
+          </div>
+
+          <!-- 搬运进度条（v2） -->
+          <div v-if="currentProgress" class="mini-progress">
+            <div class="mini-bar">
+              <div class="mini-fill" :style="{ width: currentProgress.pct + '%' }" />
+            </div>
+            <div class="mini-meta">
+              <span>{{ currentProgress.pct.toFixed(1) }}%</span>
+              <span class="faint">
+                {{ formatBytes(currentProgress.written) }} /
+                {{ formatBytes(currentProgress.total) }}
+                <template v-if="btnMode === 'running'">
+                  · {{ formatBytes(currentProgress.speed) }}/s
+                </template>
+              </span>
+              <button
+                v-if="btnMode === 'running' || btnMode === 'paused' || btnMode === 'error'"
+                class="mini-cancel"
+                @click="cancelCurrent"
+              >
+                取消
+              </button>
+            </div>
           </div>
           <div v-if="pickerOpen" class="launch-menu">
             <button
@@ -463,11 +681,22 @@ onUnmounted(() => {
         <div v-for="v in versions" :key="v.id" class="version-item">
           <div class="version-row">
             <button class="icon-btn danger" title="删除版本" @click="removeVersion(v)">✕</button>
+            <button
+              class="icon-btn"
+              :class="{ 'cache-on': versionStates[v.id]?.cached }"
+              :title="versionStates[v.id]?.cached ? '从缓存池移除版本' : '该版本未缓存'"
+              :disabled="!versionStates[v.id]?.cached"
+              @click="removeCacheOf(v)"
+            >
+              ⇩
+            </button>
             <button class="version-toggle" @click="toggle(v.id)">
               <span class="version-name">{{ v.display_name }}</span>
               <span class="tag" v-if="v.source === 'manual'">手动</span>
               <span class="tag" v-if="v.game_type === 'archive'">压缩包</span>
               <span class="tag off" v-if="v.status === 'missing'">缺失</span>
+              <span class="tag" v-if="versionStates[v.id]?.cached">已缓存</span>
+              <span class="tag off" v-if="versionStates[v.id]?.cache_missing">缓存失效</span>
               <span class="tag off" v-if="!hasLaunchItem(v)">未配启动项</span>
               <span class="faint version-size">{{ formatBytes(v.size_bytes) }}</span>
               <span class="version-caret">{{ expanded.includes(v.id) ? "▾" : "▸" }}</span>

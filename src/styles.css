@@ -921,3 +921,233 @@ button.danger-solid:hover:not(:disabled) {
   background: #ef6b6b;
   border-color: #ef6b6b;
 }
+
+/* ==========================================================================
+   v2：缓存池 / 搬运
+   ========================================================================== */
+
+.cache-section h3 {
+  margin-bottom: 12px;
+}
+
+.cache-row {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  margin-bottom: 16px;
+}
+
+.cache-ring {
+  position: relative;
+  width: 92px;
+  height: 92px;
+  flex: 0 0 auto;
+}
+
+.cache-ring svg {
+  width: 100%;
+  height: 100%;
+  transform: rotate(-90deg);
+}
+
+.ring-bg,
+.ring-fg {
+  fill: none;
+  stroke-width: 3.2;
+}
+
+.ring-bg {
+  stroke: var(--border);
+}
+
+.ring-fg {
+  stroke: var(--accent);
+  stroke-linecap: round;
+  transition: stroke-dasharray 0.3s ease;
+}
+
+.ring-text {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.cache-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.cache-line {
+  font-size: 14px;
+}
+
+.quota-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.quota-row input {
+  max-width: 160px;
+}
+
+.unit-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.unit-toggle button {
+  border: none;
+  border-radius: 0;
+  padding: 6px 14px;
+  background: transparent;
+}
+
+.unit-toggle button.active {
+  background: var(--bg-active);
+  color: var(--text);
+}
+
+/* 详情页小进度条 */
+.mini-progress {
+  margin-top: 8px;
+  width: 260px;
+}
+
+.mini-bar {
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.mini-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s linear;
+}
+
+.mini-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 5px;
+  font-size: 12px;
+}
+
+.mini-cancel {
+  margin-left: auto;
+  font-size: 12px;
+  padding: 2px 8px;
+}
+
+/* 搬运页 */
+.transfer-view {
+  padding: 4px 4px 24px;
+}
+
+.transfer-title {
+  margin: 0;
+  font-size: 18px;
+}
+
+.task-group {
+  margin-top: 18px;
+}
+
+.task-group-title {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+}
+
+.task-card {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+
+.task-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.task-name {
+  font-weight: 600;
+}
+
+.task-size {
+  margin-left: auto;
+}
+
+.task-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.task-bar {
+  flex: 1;
+  height: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.task-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s linear;
+}
+
+.task-pct {
+  width: 52px;
+  text-align: right;
+  font-size: 12px;
+}
+
+.task-meta {
+  display: flex;
+  gap: 14px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.failed-list {
+  margin-top: 6px;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.task-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+  justify-content: flex-end;
+}
+
+.ok {
+  color: var(--ok);
+}
+
+.error-text {
+  color: var(--danger);
+}
+
+.icon-btn.cache-on {
+  color: var(--accent);
+}
+

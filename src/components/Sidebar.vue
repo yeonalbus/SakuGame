@@ -15,6 +15,13 @@ const emit = defineEmits<{ navigate: [key: string] }>();
     </button>
     <button
       class="nav-item"
+      :class="{ active: active === 'transfer' }"
+      @click="emit('navigate', 'transfer')"
+    >
+      搬运
+    </button>
+    <button
+      class="nav-item"
       :class="{ active: active === 'settings' }"
       @click="emit('navigate', 'settings')"
     >

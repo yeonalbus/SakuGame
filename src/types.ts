@@ -141,4 +141,82 @@ export interface AppErrorPayload {
   message: string;
 }
 
-export type ViewKey = "home" | "settings" | "detail";
+// ---- v2：缓存池 / 搬运 ----
+
+export type TransferStatus = "queued" | "running" | "paused" | "error" | "done";
+
+export type PreflightReason =
+  | "pool_not_configured"
+  | "invalid_version"
+  | "archive_unsupported"
+  | "already_cached"
+  | "quota_exceeded"
+  | "disk_exceeded";
+
+export interface CacheConfig {
+  /** 绝对路径；null = 未配置 */
+  root: string | null;
+  quota_bytes: number;
+}
+
+export interface CacheUsage {
+  quota_bytes: number;
+  used_bytes: number;
+  free_bytes: number;
+  disk_total_bytes: number;
+  disk_free_bytes: number;
+  safety_bytes: number;
+  available_bytes: number;
+}
+
+export interface TransferPreflight {
+  ok: boolean;
+  reason: PreflightReason | null;
+  required_bytes: number;
+  available_quota_bytes: number;
+  available_disk_bytes: number;
+}
+
+export interface TransferTaskView {
+  task_id: number;
+  repository_id: number;
+  game_id: number;
+  version_id: number;
+  repo_no: string;
+  game_name: string;
+  version_label: string;
+  total_bytes: number;
+  written_bytes: number;
+  total_files: number;
+  written_files: number;
+  status: TransferStatus;
+  speed_bps: number;
+  eta_secs: number | null;
+  error: string | null;
+  failed_files: string[];
+}
+
+export interface TransferProgressEvent {
+  task_id: number;
+  written_bytes: number;
+  total_bytes: number;
+  speed_bps: number;
+  eta_secs: number | null;
+  status: TransferStatus;
+}
+
+/** 详情页按钮态机用的版本运行时状态 */
+export interface VersionState {
+  version_id: number;
+  cached: boolean;
+  cache_missing: boolean;
+  task: TransferTaskView | null;
+}
+
+export interface RepositoryDeletePreview {
+  cache_count: number;
+  cache_bytes: number;
+  active_task_count: number;
+}
+
+export type ViewKey = "home" | "transfer" | "settings" | "detail";

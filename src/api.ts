@@ -2,14 +2,21 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   BlocklistRow,
+  CacheConfig,
+  CacheUsage,
   ExeCandidate,
   GameDetail,
   GameRow,
   NewRepository,
+  RepositoryDeletePreview,
   RepositoryRow,
   ScanProgress,
   ScanSummary,
+  TransferPreflight,
+  TransferProgressEvent,
+  TransferTaskView,
   UnblockOutcome,
+  VersionState,
 } from "./types";
 
 export const api = {
@@ -75,6 +82,31 @@ export const api = {
   resumeScan: () => invoke<void>("resume_scan"),
   cancelScan: () => invoke<void>("cancel_scan"),
   scanStatus: () => invoke<ScanProgress | null>("scan_status"),
+
+  // ---- 缓存池（v2）----
+  getCacheConfig: () => invoke<[CacheConfig, CacheUsage]>("get_cache_config"),
+  setCacheConfig: (root: string | null, quotaBytes: number) =>
+    invoke<void>("set_cache_config", { root, quotaBytes }),
+  getCacheUsage: () => invoke<CacheUsage>("get_cache_usage"),
+  preflightTransfer: (versionId: number) =>
+    invoke<TransferPreflight>("preflight_transfer", { versionId }),
+
+  // ---- 搬运（v2）----
+  startTransfer: (versionId: number) => invoke<number>("start_transfer", { versionId }),
+  listTransfers: () => invoke<TransferTaskView[]>("list_transfers"),
+  getVersionTransfer: (versionId: number) =>
+    invoke<TransferTaskView | null>("get_version_transfer", { versionId }),
+  getVersionStates: (gameId: number) => invoke<VersionState[]>("get_version_states", { gameId }),
+  pauseTransfer: (taskId: number) => invoke<void>("pause_transfer", { taskId }),
+  resumeTransfer: (taskId: number) => invoke<void>("resume_transfer", { taskId }),
+  cancelTransfer: (taskId: number) => invoke<void>("cancel_transfer", { taskId }),
+  retryTransfer: (taskId: number) => invoke<number>("retry_transfer", { taskId }),
+  removeCache: (versionId: number) => invoke<void>("remove_cache", { versionId }),
+
+  // ---- 启动 / 仓库（v2）----
+  launchGame: (gameId: number) => invoke<void>("launch_game", { gameId }),
+  getRepositoryDeletePreview: (repositoryId: number) =>
+    invoke<RepositoryDeletePreview>("get_repository_delete_preview", { repositoryId }),
 };
 
 export function onScanProgress(cb: (p: ScanProgress) => void): Promise<UnlistenFn> {
@@ -89,6 +121,22 @@ export function onScanFailed(
   cb: (p: { job_id: number; message: string }) => void,
 ): Promise<UnlistenFn> {
   return listen<{ job_id: number; message: string }>("scan://failed", (e) => cb(e.payload));
+}
+
+export function onTransferProgress(
+  cb: (p: TransferProgressEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<TransferProgressEvent>("transfer://progress", (e) => cb(e.payload));
+}
+
+export function onTransferState(
+  cb: (t: TransferTaskView | null) => void,
+): Promise<UnlistenFn> {
+  return listen<TransferTaskView | null>("transfer://state", (e) => cb(e.payload));
+}
+
+export function onCacheUsage(cb: (u: CacheUsage) => void): Promise<UnlistenFn> {
+  return listen<CacheUsage>("cache://usage", (e) => cb(e.payload));
 }
 
 /** 把后端 AppError（{ kind, message }）转成可读文本 */

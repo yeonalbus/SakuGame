@@ -2,9 +2,15 @@
 import { ref, reactive, computed, onMounted, onUnmounted } from "vue";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
-import { api, errorText, onScanFailed, onScanFinished, onScanProgress } from "../api";
+import { api, errorText, formatBytes, onScanFailed, onScanFinished, onScanProgress } from "../api";
 import { askConfirm } from "../confirm";
-import type { BlocklistRow, NewRepository, RepositoryRow, ScanProgress } from "../types";
+import type {
+  BlocklistRow,
+  CacheUsage,
+  NewRepository,
+  RepositoryRow,
+  ScanProgress,
+} from "../types";
 
 const emit = defineEmits<{ toast: [text: string, error?: boolean] }>();
 
@@ -25,6 +31,60 @@ const lastWarnings = ref<{
 
 const form = reactive({ drive: "", ip: "", host: "" });
 const unlisteners: UnlistenFn[] = [];
+
+// ---- v2：缓存池 ----
+const cacheRoot = ref("");
+const cacheQuotaValue = ref(10);
+const cacheUnit = ref<"MB" | "GB">("GB");
+const cacheUsage = ref<CacheUsage | null>(null);
+const cacheLocked = ref(false);
+
+const cacheQuotaBytes = computed(() =>
+  cacheUnit.value === "GB"
+    ? Math.round(cacheQuotaValue.value * 1024 * 1024 * 1024)
+    : Math.round(cacheQuotaValue.value * 1024 * 1024),
+);
+const cachePct = computed(() => {
+  const u = cacheUsage.value;
+  if (!u || u.quota_bytes <= 0) return 0;
+  return Math.min(100, (u.used_bytes / u.quota_bytes) * 100);
+});
+
+async function loadCache() {
+  try {
+    const [cfg, usage] = await api.getCacheConfig();
+    cacheRoot.value = cfg.root ?? "";
+    cacheUsage.value = usage;
+    const gb = cfg.quota_bytes / 1024 / 1024 / 1024;
+    if (Number.isInteger(gb) && gb >= 1) {
+      cacheUnit.value = "GB";
+      cacheQuotaValue.value = gb;
+    } else {
+      cacheUnit.value = "MB";
+      cacheQuotaValue.value = Math.round(cfg.quota_bytes / 1024 / 1024);
+    }
+    // 有缓存或有在途任务时锁定路径（后端仍会二次校验）
+    cacheLocked.value = usage.used_bytes > 0;
+  } catch (e) {
+    emit("toast", errorText(e), true);
+  }
+}
+
+async function saveCache() {
+  const root = cacheRoot.value.trim() || null;
+  const quota = cacheQuotaBytes.value;
+  if (!Number.isFinite(quota) || quota <= 0) {
+    emit("toast", "容量必须为正整数", true);
+    return;
+  }
+  try {
+    await api.setCacheConfig(root, quota);
+    await loadCache();
+    emit("toast", "缓存池配置已保存");
+  } catch (e) {
+    emit("toast", errorText(e), true);
+  }
+}
 
 const scanning = computed(
   () => progress.value?.phase === "scanning" || progress.value?.phase === "paused",
@@ -188,11 +248,28 @@ async function addRepo() {
 }
 
 async function removeRepo(repo: RepositoryRow) {
+  let extra = "";
+  let blocked = false;
+  try {
+    const pv = await api.getRepositoryDeletePreview(repo.id);
+    if (pv.active_task_count > 0) {
+      emit("toast", "该仓库还有搬运任务，请先取消任务再删除", true);
+      blocked = true;
+    } else if (pv.cache_count > 0) {
+      extra =
+        `\n\n该仓库有 ${pv.cache_count} 个游戏在缓存池中（占用 ${formatBytes(pv.cache_bytes)}），` +
+        `删除仓库会一并清理这些池内文件。`;
+    }
+  } catch {
+    /* 预览失败不阻塞删除流程 */
+  }
+  if (blocked) return;
   const ok = await askConfirm(
     "删除仓库",
     `将删除仓库「${repo.name}」。\n\n` +
       `该仓库下所有档案与版本都会被一并删除（含手填的名称、编号、封面），` +
-      `且不进入黑名单；重新添加后需要重新扫描。`,
+      `且不进入黑名单；重新添加后需要重新扫描。` +
+      extra,
     { confirmText: "删除仓库", danger: true },
   );
   if (!ok) return;
@@ -200,6 +277,7 @@ async function removeRepo(repo: RepositoryRow) {
     await api.deleteRepository(repo.id);
     await loadRepos();
     await loadBlocklist();
+    await loadCache();
     emit("toast", "仓库已删除");
   } catch (e) {
     emit("toast", errorText(e), true);
@@ -232,6 +310,7 @@ function fmtTime(v: string | null): string {
 onMounted(async () => {
   await loadRepos();
   await loadBlocklist();
+  await loadCache();
   await refreshProgress();
   version.value = await getVersion().catch(() => "0.1.0");
   unlisteners.push(
@@ -291,6 +370,70 @@ onUnmounted(() => {
     </nav>
 
     <div v-if="tab === 'repos'">
+      <!-- v2：缓存池 -->
+      <div class="section cache-section">
+        <h3>缓存管理</h3>
+        <div class="cache-row">
+          <div class="cache-ring">
+            <svg viewBox="0 0 36 36">
+              <circle cx="18" cy="18" r="15.915" class="ring-bg" />
+              <circle
+                cx="18"
+                cy="18"
+                r="15.915"
+                class="ring-fg"
+                :style="{ strokeDasharray: cachePct + ' 100' }"
+              />
+            </svg>
+            <div class="ring-text">{{ cachePct.toFixed(0) }}%</div>
+          </div>
+          <div class="cache-info">
+            <div class="cache-line">
+              已用 {{ formatBytes(cacheUsage?.used_bytes ?? 0) }} /
+              {{ formatBytes(cacheUsage?.quota_bytes ?? 0) }}
+            </div>
+            <div class="faint">剩余配额 {{ formatBytes(cacheUsage?.free_bytes ?? 0) }}</div>
+            <div class="faint">
+              盘剩余 {{ formatBytes(cacheUsage?.disk_free_bytes ?? 0) }} · 安全线
+              {{ formatBytes(cacheUsage?.safety_bytes ?? 0) }} · 可用
+              {{ formatBytes(cacheUsage?.available_bytes ?? 0) }}
+            </div>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>缓存池路径</label>
+          <input
+            v-model="cacheRoot"
+            :disabled="cacheLocked"
+            placeholder="例如 D:\SakuCache"
+          />
+          <div v-if="cacheLocked" class="faint">
+            已有缓存或搬运任务，路径已锁定；请先清空缓存池再修改
+          </div>
+        </div>
+
+        <div class="field">
+          <label>容量</label>
+          <div class="quota-row">
+            <input
+              v-model.number="cacheQuotaValue"
+              type="number"
+              min="1"
+              step="1"
+              :disabled="cacheLocked"
+            />
+            <div class="unit-toggle">
+              <button :class="{ active: cacheUnit === 'GB' }" @click="cacheUnit = 'GB'">GB</button>
+              <button :class="{ active: cacheUnit === 'MB' }" @click="cacheUnit = 'MB'">MB</button>
+            </div>
+          </div>
+          <div class="faint">默认 10 GB；扩容后盘上至少留出盘总容量 10% 的余量</div>
+        </div>
+
+        <button class="primary" @click="saveCache">保存缓存池配置</button>
+      </div>
+
       <!-- 上栏：进度区 -->
       <div class="progress-area">
         <div v-if="progress">
