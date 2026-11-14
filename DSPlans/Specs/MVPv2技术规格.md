@@ -230,7 +230,7 @@ used = Σ cache_entries(status='ok').size_bytes
 | 5 | `required > quota - used` | `QuotaExceeded` |
 | 6 | `required > available` | `DiskExceeded` |
 
-`required` = 本次要搬的字节。首次搬 = 版本 `size_bytes`（v1.1 已落库，扫描时按"本层文件大小之和"算，不含子目录——**需要改为递归求和**，见 §6.1）。恢复 = `total_bytes - written_bytes`。
+`required` = 本次要搬的字节。首次搬 = 版本 `size_bytes`（**已改为递归求和**，含子目录，与搬运量一致；见 §6.1）。恢复 = `total_bytes - written_bytes`。
 
 ### 5.4 扩容/缩容判定（前端实时反馈 + 后端二次校验）
 
@@ -249,7 +249,7 @@ new_quota >= used
 
 `preflight_transfer` 通过后，在同一把容量锁内：
 
-1. 遍历源版本目录，**递归**累计 `total_bytes` / `total_files`（v1.1 的 `size_bytes` 只算本层，搬运必须递归；递归结果写回 `transfer_tasks`，不回写 `game_versions.size_bytes`，避免改 v1.1 语义）
+1. 遍历源版本目录，**递归**累计 `total_bytes` / `total_files`（`game_versions.size_bytes` 已同步改为递归求和，二者口径一致；任务创建时仍独立求和一次，防源目录在扫描后变化）
 2. 检查磁盘/配额（用 §5.3 条件，此时 `used` 已含本任务，故判 `required` 相对更新后的余量）
 3. 插入 `transfer_tasks(status='queued')` → **任务字节即刻计入已用（预留）**
 4. 唤醒调度器；返回 `task_id`
@@ -555,7 +555,7 @@ fn repo_no(id: i64) -> String { format!("R{id:02}") }
 | R-4 | 长路径 | verbatim 前缀全链路；预检提示 |
 | R-5 | SMB 断连卡住工作线程 | 文件级超时（读操作设 30s 超时后按失败处理）；出错保留现场 |
 | R-6 | 池内目录被外部改名 | 对账标 missing；不自动修复 |
-| R-7 | `game_versions.size_bytes` 不含子目录 | 搬运任务独立递归，不改 v1.1 语义 |
+| R-7 | 版本大小统计口径 | 已统一为**递归求和**（扫描与搬运一致）；大目录（42k 文件）扫描耗时会增加，只 stat 不读内容 |
 | R-8 | 删除仓库误伤 | 前置预览（数量/体积/任务数），前端二次确认（产品侧已要求） |
 
 **未决（实现时若出现需回报）**
