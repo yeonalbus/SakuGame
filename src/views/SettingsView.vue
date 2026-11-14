@@ -37,7 +37,8 @@ const cacheRoot = ref("");
 const cacheQuotaValue = ref(10);
 const cacheUnit = ref<"MB" | "GB">("GB");
 const cacheUsage = ref<CacheUsage | null>(null);
-const cacheLocked = ref(false);
+/** 有缓存或在途任务时只锁「路径」；容量随时可改（受缩容/扩容校验约束） */
+const cachePathLocked = ref(false);
 
 const cacheQuotaBytes = computed(() =>
   cacheUnit.value === "GB"
@@ -48,6 +49,23 @@ const cachePct = computed(() => {
   const u = cacheUsage.value;
   if (!u || u.quota_bytes <= 0) return 0;
   return Math.min(100, (u.used_bytes / u.quota_bytes) * 100);
+});
+
+/** 可设容量范围：下限 = 已用（缩容），上限 = 已用 + 物理可用（扩容） */
+const quotaRange = computed(() => {
+  const u = cacheUsage.value;
+  if (!u || !u.disk_total_bytes) return null;
+  return {
+    min: u.used_bytes,
+    max: u.used_bytes + Math.max(0, u.available_bytes),
+  };
+});
+
+const quotaInvalid = computed(() => {
+  const r = quotaRange.value;
+  if (!r) return false;
+  const q = cacheQuotaBytes.value;
+  return q < r.min || q > r.max;
 });
 
 async function loadCache() {
@@ -64,7 +82,7 @@ async function loadCache() {
       cacheQuotaValue.value = Math.round(cfg.quota_bytes / 1024 / 1024);
     }
     // 有缓存或有在途任务时锁定路径（后端仍会二次校验）
-    cacheLocked.value = usage.used_bytes > 0;
+    cachePathLocked.value = usage.used_bytes > 0;
   } catch (e) {
     emit("toast", errorText(e), true);
   }
@@ -405,10 +423,10 @@ onUnmounted(() => {
           <label>缓存池路径</label>
           <input
             v-model="cacheRoot"
-            :disabled="cacheLocked"
+            :disabled="cachePathLocked"
             placeholder="例如 D:\SakuCache"
           />
-          <div v-if="cacheLocked" class="faint">
+          <div v-if="cachePathLocked" class="faint">
             已有缓存或搬运任务，路径已锁定；请先清空缓存池再修改
           </div>
         </div>
@@ -421,17 +439,24 @@ onUnmounted(() => {
               type="number"
               min="1"
               step="1"
-              :disabled="cacheLocked"
             />
             <div class="unit-toggle">
               <button :class="{ active: cacheUnit === 'GB' }" @click="cacheUnit = 'GB'">GB</button>
               <button :class="{ active: cacheUnit === 'MB' }" @click="cacheUnit = 'MB'">MB</button>
             </div>
           </div>
-          <div class="faint">默认 10 GB；扩容后盘上至少留出盘总容量 10% 的余量</div>
+          <div class="faint">
+            默认 10 GB；缩容不低于已用，扩容后盘上至少留出盘总容量 10% 的余量
+          </div>
+          <div class="faint" v-if="quotaRange">
+            可设范围：{{ formatBytes(quotaRange.min) }} ~ {{ formatBytes(quotaRange.max) }}
+            <span v-if="quotaInvalid" class="error-text">（当前输入超出范围）</span>
+          </div>
         </div>
 
-        <button class="primary" @click="saveCache">保存缓存池配置</button>
+        <button class="primary" :disabled="quotaInvalid" @click="saveCache">
+          保存缓存池配置
+        </button>
       </div>
 
       <!-- 上栏：进度区 -->
