@@ -7,23 +7,32 @@
 
 ```
 DSPlans/
-├── plans/            # 施工方案：功能开发 plan、路线图、早期规划（Round 系列方案全部在此）
+├── Specs/            # 技术规格：各版本的可施工规格（数据结构、表结构、算法、IPC、测试矩阵）
+├── plans/            # 施工方案：功能开发 plan、路线图、开工前规划与评估
 ├── Problems/         # 问题记录：反馈问题的诊断、修复说明、答疑话术
+├── research/         # 实测与调研：真实仓库探测、性能实测、可行性验证
 ├── VerNotes/         # 发布文档：RELEASE_NOTES（详实版）、发布流程、用户 FAQ
 ├── YeonBriefs/       # 版本简报：给珱垣写 README / Release 正文的精炼素材
-└── readme.md         # 本规则文件
+├── YeonPlans-dsedit/ # 珱垣手写规划的 AI 修订副本（保留原文结构，补边界与验收）
+├── readme.md         # 本规则文件
+└── 规划文档写作指南.md # 规划文档写作规范（六层骨架、自检清单）
 ```
 
 | 子目录 | 收纳内容 | 典型文件 |
 | --- | --- | --- |
-| `plans/` | 开工前的施工方案与规划 | `round49-bookmark-redesign-plan.md`、`初版目录树.md` |
+| `Specs/` | 各版本的施工级技术规格（产品口径 → 可执行的技术方案） | `MVPv2技术规格.md`、`MVPv1.1技术规格.md`、`MVPv1扫描器规格.md` |
+| `plans/` | 开工前的施工方案、规划、就绪度评估 | `v1.1-implementation-plan.md`、`MVPv1施工就绪度评估.md`、`MVPv1决策回执清单.md` |
 | `Problems/` | 问题反馈的处理过程与结论 | `Q1-handling.md` |
+| `research/` | 实测与调研：真实仓库探测、性能实测、可行性验证 | `Z-Game实测探测报告.md` |
 | `VerNotes/` | 面向发布的详实说明与流程 | `RELEASE_NOTES_vX.Y.Z.md`、`wiki.md`、`RELEASE_PROCESS.md` |
 | `YeonBriefs/` | 给珱垣的精炼版本简报 | `BRIEF_vX.Y.Z.md` |
+| `YeonPlans-dsedit/` | 珱垣手写规划的 AI 修订副本 | `MVPv1.1设计规划1.0-dsedit.md` |
 
 ## 二、命名约定
 
 - 施工方案：`roundN-<主题>-plan.md`（N 为递增轮次），或 `<主题>-plan.md`（无轮次体系时）
+- 技术规格：`MVPv<版本>技术规格.md`、`MVPv<版本><模块>规格.md`（放 `Specs/`）
+- 实测与调研：`<主题>实测探测报告.md`、`<主题>-report.md`（放 `research/`）
 - 单版本详述：`RELEASE_NOTES_vX.Y.Z.md`
 - 版本简报：`BRIEF_vX.Y.Z.md`（与 Release Notes 同版本后缀）
 - 问题记录：`Q<序号>-<主题>.md` 或 `<主题>-diagnostic-report.md`

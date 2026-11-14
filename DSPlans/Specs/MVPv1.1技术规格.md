@@ -1,6 +1,6 @@
 # MVP v1.1 技术规格
 
-> **依据**：[MVPv1.1设计规划1.0-dsedit.md](YeonPlans-dsedit/MVPv1.1设计规划1.0-dsedit.md)（产品口径）+ [MVPv1扫描器规格.md](MVPv1扫描器规格.md)（v1 规则，仅保留仍有效部分）+ [Z-Game实测探测报告.md](Z-Game实测探测报告.md)（实测约束）
+> **依据**：[MVPv1.1设计规划1.0-dsedit.md](../YeonPlans-dsedit/MVPv1.1设计规划1.0-dsedit.md)（产品口径）+ [MVPv1扫描器规格.md](MVPv1扫描器规格.md)（v1 规则，仅保留仍有效部分）+ [Z-Game实测探测报告.md](../research/Z-Game实测探测报告.md)（实测约束）
 > **维护者**：AI。**状态**：待施工（珱垣已确认"先不施工，只落档"）。
 > **本文与产品文档的分工**：产品语言与决策归 dsedit 规划文档；本文只承载**可实现化细节**（数据结构、算法、DDL、保护矩阵、IPC、测试矩阵）。两者冲突时以规划文档的「珱垣确认」项为准。
 
@@ -104,7 +104,7 @@ pub struct ScanWarnings {
 }
 ```
 
-`ArchiveGroup` / `ArchiveFile` 沿用 v1 定义（[scanner.rs](../src-tauri/src/scanner.rs)），但**只作为版本内部结构**，不再产生独立档案。
+`ArchiveGroup` / `ArchiveFile` 沿用 v1 定义（[scanner.rs](../../src-tauri/src/scanner.rs)），但**只作为版本内部结构**，不再产生独立档案。
 
 ---
 

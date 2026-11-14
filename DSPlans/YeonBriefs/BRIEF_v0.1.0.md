@@ -3,7 +3,7 @@
 > 生成：实现侧（鲸娘）
 > 日期：2026-11-01（第一轮）／2026-11-02（v1.1）
 > 状态：**已实现完成，待主人实机验证**
-> 依据：`DSPlans/MVPv1扫描器规格.md`、[MVPv1.1技术规格.md](../MVPv1.1技术规格.md)、[MVPv1设计规划2.0](../YeonPlans-dsedit/MVPv1设计规划2.0-ACC_dsedit.md)（D1–D20）、[MVPv1.1设计规划1.0](../YeonPlans-dsedit/MVPv1.1设计规划1.0-dsedit.md)
+> 依据：`DSPlans/Specs/MVPv1扫描器规格.md`、[MVPv1.1技术规格.md](../Specs/MVPv1.1技术规格.md)、[MVPv1设计规划2.0](../YeonPlans-dsedit/MVPv1设计规划2.0-ACC_dsedit.md)（D1–D20）、[MVPv1.1设计规划1.0](../YeonPlans-dsedit/MVPv1.1设计规划1.0-dsedit.md)
 >
 > **本简报覆盖两轮**：§1–§6 为 MVP v1 首轮实现（2026-11-01 的历史记录，保留不改），§7 为 MVP v1.1（2026-11-02）。
 > **版本口径**：`0.1.0` = MVP v1 + v1.1 合并（v1 未单独发版，按 CHANGELOG 规则并入本版）。

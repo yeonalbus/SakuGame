@@ -21,14 +21,14 @@ SakuGame/
 ├── src/                 # Vue 3 前端源码
 ├── src-tauri/           # Rust 后端源码（Tauri v2）
 ├── YeonPlans/           # 珱垣手写区：规划、笔记、协作方案（AI 只读）
-├── DSPlans/             # AI 文档区：方案、诊断、发布文档
+├── DSPlans/             # AI 文档区：技术规格、方案、诊断、发布文档
 ├── dist/                # 前端构建产物（不入库）
 ├── node_modules/        # 依赖目录（不入库）
 ├── .obsidian/           # 本地 Obsidian 配置（不入库）
 └── .vscode/             # 编辑器配置（仅 extensions.json 入库）
 ```
 
-`DSPlans/` 内部结构见 `DSPlans/readme.md`（plans / Problems / Research / VerNotes / YeonBriefs）。
+`DSPlans/` 内部结构见 `DSPlans/readme.md`（Specs / plans / Problems / research / VerNotes / YeonBriefs / YeonPlans-dsedit）。
 
 ## 二、前端 `src/`
 
