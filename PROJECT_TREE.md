@@ -62,8 +62,8 @@ SakuGame/
 | `src/commands.rs` | Tauri 命令层：仓库 CRUD（含删除预览）、档案 / 版本读写、可执行文件配置、黑名单、扫描控制、缓存池配置、预检、搬运控制、从缓存池移除、启动、版本运行时状态 |
 | `src/scanner.rs` | 扫描器：两层枚举（游戏标识层 → 版本标识层）、版本大小递归统计（含子目录）、压缩白名单与分卷聚合、排除名单、根级目录排除、可见性告警 |
 | `src/store.rs` | 两层结构幂等落库：游戏 + 版本 + 可执行文件，重扫保护矩阵，黑名单跳过 |
-| `src/db.rs` | SQLite 持久化层（WAL、外键、schema v3：v1.1 八表 + `transfer_tasks` / `cache_entries`；检测到 v1 旧库则清空业务表重建） |
-| `src/cache.rs` | 缓存池：配置读写与校验（路径不得在仓库根内、有缓存时锁路径）、容量记账（已用 / 预留 / 安全线）、预检、池内路径约定（仓库编号 `R{id}`）、对账（`missing` 标记）、从缓存池移除 |
+| `src/db.rs` | SQLite 持久化层（WAL、外键、schema v4：v1.1 八表 + `transfer_tasks` / `cache_entries` + `repositories.cache_slot` 槽位号；检测到 v1 旧库则清空业务表重建） |
+| `src/cache.rs` | 缓存池：配置读写与校验（路径不得在仓库根内、有缓存时锁路径）、槽位号分配（最小可用号）、容量记账（已用 / 预留 / 安全线）、预检、池内路径约定（`R{槽位}`）、对账（`missing` 标记）、从缓存池移除 |
 | `src/transfer.rs` | 搬运机：任务创建与预留、调度线程（全局 32 通道 + 按文件数定档 4/8/16/32）、staging 复制与进度、L1 校验、原子 rename、暂停 / 恢复 / 取消、失败重试、崩溃恢复 |
 | `src/models.rs` | 数据模型：两层结构 DTO（`GameRow` / `GameVersionRow` / `ExecutableRow` / `BlocklistRow`）+ 扫描器内部结构 + v2 缓存池 / 搬运 DTO |
 | `src/locator.rs` | 仓库定位：盘符 → IP → 主机名可达性探测 |
