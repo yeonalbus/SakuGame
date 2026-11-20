@@ -135,6 +135,8 @@ export interface ScanSummary {
   root_loose_files: number;
   truncated_with_version_dirs: number;
   enum_failed: number;
+  /** v2.1：锚点写入失败的版本数（只读盘 / 网络 / 权限） */
+  anchor_failed: number;
   scope: ScanScope;
 }
 

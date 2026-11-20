@@ -207,15 +207,16 @@ fn upsert_game(
         None => {
             tx.execute(
                 "INSERT INTO games(repository_id, relative_path, layout, display_name,
-                                   size_bytes, status, created_at, updated_at)
-                 VALUES(?1, ?2, ?3, ?4, ?5, 'ok', ?6, ?6)",
+                                   size_bytes, status, created_at, updated_at, game_uuid)
+                 VALUES(?1, ?2, ?3, ?4, ?5, 'ok', ?6, ?6, ?7)",
                 params![
                     repository_id,
                     g.relative_path,
                     g.layout.as_str(),
                     g.display_name,
                     g.size_bytes as i64,
-                    now
+                    now,
+                    uuid::Uuid::new_v4().to_string()
                 ],
             )?;
             Ok((tx.last_insert_rowid(), true))
@@ -264,15 +265,17 @@ fn upsert_version(
         None => {
             tx.execute(
                 "INSERT INTO game_versions(game_id, relative_path, version_label, display_name,
-                                           game_type, size_bytes, source, status, created_at, updated_at)
-                 VALUES(?1, ?2, ?3, ?3, ?4, ?5, 'scan', 'ok', ?6, ?6)",
+                                           game_type, size_bytes, source, status, created_at,
+                                           updated_at, version_uuid)
+                 VALUES(?1, ?2, ?3, ?3, ?4, ?5, 'scan', 'ok', ?6, ?6, ?7)",
                 params![
                     game_id,
                     v.relative_path,
                     v.version_label,
                     v.game_type.as_str(),
                     v.size_bytes as i64,
-                    now
+                    now,
+                    uuid::Uuid::new_v4().to_string()
                 ],
             )?;
             tx.last_insert_rowid()
@@ -575,6 +578,36 @@ mod tests {
 
     fn count(db: &Db, sql: &str) -> i64 {
         db.with(|c| Ok(c.query_row(sql, [], |r| r.get(0))?)).unwrap()
+    }
+
+    /// v2.1：新扫描入库的档案 / 版本必须立刻带 UUID（不再依赖启动时回填，否则锚点写不出来）
+    #[test]
+    fn scan_assigns_uuids_immediately() {
+        let (db, dir) = temp_db("uuid");
+        let repo = seed_repo(&db);
+        apply_report(&db, repo, &[standard_game("AC001", &["Ver_1.0"])], true).unwrap();
+
+        let (game_uuid, version_uuid): (Option<String>, Option<String>) = db
+            .with(|c| {
+                Ok(c.query_row(
+                    "SELECT g.game_uuid, v.version_uuid FROM games g
+                     JOIN game_versions v ON v.game_id = g.id
+                     WHERE g.relative_path='AC001'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert!(
+            game_uuid.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
+            "game_uuid 应在入库时立即生成"
+        );
+        assert!(
+            version_uuid.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
+            "version_uuid 应在入库时立即生成"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// T-1.1-13 / ACC-13：重扫必须保留全部用户字段

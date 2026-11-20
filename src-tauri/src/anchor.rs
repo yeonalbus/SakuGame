@@ -86,14 +86,15 @@ impl AnchorSync {
 }
 
 /// 保证版本层根下有正确锚点。
-/// `SakuAlter` 不存在时**不创建目录**、直接 skipped（不污染用户仓库）。
+/// `SakuAlter` 不存在时**创建目录**（扫描期也要落锚点）；写入失败（只读盘 / 网络）向上返回错误，
+/// 由调用方按告警处理，不阻断扫描。
 pub fn ensure_anchor(version_root: &Path, game_uuid: &str, version_uuid: &str) -> AppResult<AnchorSync> {
     if game_uuid.is_empty() || version_uuid.is_empty() {
         return Ok(AnchorSync::skipped());
     }
     let dir = alter_dir(version_root);
-    if !dir.exists() {
-        return Ok(AnchorSync::skipped());
+    if !dir.is_dir() {
+        std::fs::create_dir_all(extend_path(&dir))?;
     }
     let path = dir.join(ANCHOR_FILE);
     let existing = read_anchor(&path);
@@ -124,8 +125,22 @@ pub fn ensure_anchor(version_root: &Path, game_uuid: &str, version_uuid: &str) -
     })
 }
 
-/// 扫描落库后同步整仓锚点（只处理已存在 `SakuAlter` 的版本）。
-pub fn sync_repository(db: &Db, repository_root: &Path, repository_id: i64) -> AppResult<u32> {
+/// 锚点同步统计（扫描告警用）
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SyncReport {
+    /// 成功写入（created / rewritten / ok）的版本数
+    pub written: u32,
+    /// 写入失败（只读盘 / 权限 / 网络）的版本数
+    pub failed: u32,
+}
+
+/// 扫描落库后同步整仓锚点（每个版本一个）。
+/// 单个版本写失败只计数，不中断其余版本。
+pub fn sync_repository(
+    db: &Db,
+    repository_root: &Path,
+    repository_id: i64,
+) -> AppResult<SyncReport> {
     let rows: Vec<(i64, String, String, String)> = db.with(|conn| {
         let mut stmt = conn.prepare(
             "SELECT v.id, v.relative_path, COALESCE(g.game_uuid,''), COALESCE(v.version_uuid,'')
@@ -143,25 +158,26 @@ pub fn sync_repository(db: &Db, repository_root: &Path, repository_id: i64) -> A
         Ok(it.filter_map(|r| r.ok()).collect())
     })?;
 
-    let mut written = 0u32;
+    let mut report = SyncReport::default();
     for (version_id, version_rel, game_uuid, version_uuid) in rows {
         let vroot = join_rel(repository_root, &version_rel);
-        let sync = ensure_anchor(&vroot, &game_uuid, &version_uuid)?;
-        if sync.state == "skipped" {
-            continue;
+        match ensure_anchor(&vroot, &game_uuid, &version_uuid) {
+            Ok(sync) if sync.state == "skipped" => continue,
+            Ok(sync) => {
+                db.with(|conn| {
+                    conn.execute(
+                        "UPDATE game_versions SET anchor_hash=?1, last_known_path=?2 WHERE id=?3",
+                        params![sync.hash, vroot.to_string_lossy().to_string(), version_id],
+                    )?;
+                    Ok(())
+                })?;
+                report.written += 1;
+            }
+            // 只读盘 / 网络异常 / 权限：记告警，不影响扫描结果
+            Err(_) => report.failed += 1,
         }
-        if sync.state != "ok" {
-            written += 1;
-        }
-        db.with(|conn| {
-            conn.execute(
-                "UPDATE game_versions SET anchor_hash=?1, last_known_path=?2 WHERE id=?3",
-                params![sync.hash, vroot.to_string_lossy().to_string(), version_id],
-            )?;
-            Ok(())
-        })?;
     }
-    Ok(written)
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------
@@ -311,12 +327,38 @@ mod tests {
         dir
     }
 
+    /// 扫描期也要落锚点：SakuAlter 不存在时自动创建
     #[test]
-    fn ensure_anchor_skips_without_alter_dir() {
-        let dir = temp_dir("skip");
+    fn ensure_anchor_creates_alter_dir() {
+        let dir = temp_dir("createdir");
         let sync = ensure_anchor(&dir, "g-1", "v-1").unwrap();
+        assert_eq!(sync.state, "created");
+        assert!(alter_dir(&dir).is_dir(), "扫描期应创建 SakuAlter 目录");
+        assert_eq!(read_anchor(&anchor_path(&dir)).unwrap().version_uuid, "v-1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 写入失败（只读盘 / 父路径非法）必须向上返回错误，由 sync_repository 计入告警
+    #[test]
+    fn ensure_anchor_reports_error_when_unwritable() {
+        let dir = temp_dir("badroot");
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap(); // 用文件占位，使其下无法建目录
+        let root = blocker.join("nested");
+        assert!(
+            ensure_anchor(&root, "g-1", "v-1").is_err(),
+            "无法创建目录时应返回错误"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// UUID 缺失（历史行未回填）时跳过，不写错误内容
+    #[test]
+    fn ensure_anchor_skips_without_uuid() {
+        let dir = temp_dir("nouuid");
+        let sync = ensure_anchor(&dir, "", "v-1").unwrap();
         assert_eq!(sync.state, "skipped");
-        assert!(!alter_dir(&dir).exists(), "不得创建 SakuAlter 目录");
+        assert!(!alter_dir(&dir).exists(), "无 UUID 时不应动仓库目录");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

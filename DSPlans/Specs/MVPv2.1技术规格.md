@@ -208,10 +208,12 @@ CREATE TABLE IF NOT EXISTS writeback_packages (
 
 | 时机 | 行为 |
 | --- | --- |
-| 扫描建档（含单游戏重扫） | 版本层根**已有** `SakuAlter` → 校验/补写锚点；**没有** → 不创建 `SakuAlter`，不生成（避免污染用户仓库） |
+| 扫描建档（含单游戏重扫） | 对每个版本**创建 `SakuAlter`（不存在则建）并写入锚点**；写入失败（只读盘 / 网络 / 权限）计入扫描告警（`ScanSummary.anchor_failed`），不阻断入库 |
 | 搬运完成后注入 | `SakuAlter` 存在且锚点缺失 → 生成；存在且 `version_uuid` 不符 → 重写为 DB 值（视为用户从别处拷贝来的旧锚点） |
 | 回写存储完成 | `SakuAlter` 为本次创建 → 生成锚点 |
-| 用户手删锚点 | `last_known_path` 可达 → 用 DB 的 `game_uuid`/`version_uuid` 重建，`created_at` 刷新；不可达 → 该版本悬空，搬运时走 §5.3 兜底或报错 |
+| 用户手删锚点 | `last_known_path` 可达 → 用 DB 的 `game_uuid`/`version_uuid` 重建，`created_at` 刷新；不可达 → 该版本悬空，搬运时走 §5.2 兜底或报错 |
+
+`game_uuid` / `version_uuid` 在**入库时就生成**（不再依赖启动时回填），否则扫描后锚点写不出来。既有历史数据在升级启动时由 `backfill_v21_uuids` 补齐；已入库但未建锚点的版本，需要**重新扫描一次**才会补出锚点。
 
 跳过判定：扫描时锚点存在且 `version_uuid` 与 DB 一致 → 该版本**不重扫**（不更新 `size_bytes`、不重建 exe 候选）。**仅标准型生效**：紧凑型的版本层就是游戏标识层，跳过省不下目录枚举，且 `game.size_bytes` 需刷新，故紧凑型不做跳过。`档案重扫`（单档案重扫 / 续扫）忽略此跳过。跳过发生在 `classify_game` 的标准型版本循环里（blocklist 过滤之后），入库时只刷 `status / updated_at`。
 

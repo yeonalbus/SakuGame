@@ -1099,8 +1099,10 @@ fn run_full_scan(
         start_index == 0,
     ) {
         Ok(outcome) => {
-            // v2.1：落库后同步锚点（只处理已存在 SakuAlter 的版本；失败不影响扫描结果）
-            let _ = anchor::sync_repository(&db, Path::new(&root), repository_id);
+            // v2.1：落库后同步锚点（每个版本都落；只读盘 / 网络失败只计告警，不影响扫描结果）
+            let anchor_report = anchor::sync_repository(&db, Path::new(&root), repository_id)
+                .unwrap_or_default();
+            let warning_total = warnings.total() + anchor_report.failed;
             let _ = db.with(|conn| {
                 conn.execute(
                     "DELETE FROM scan_checkpoints WHERE repository_id=?1",
@@ -1116,7 +1118,7 @@ fn run_full_scan(
                     params![
                         Db::now(),
                         (outcome.added + outcome.updated) as i64,
-                        warnings.total() as i64,
+                        warning_total as i64,
                         repository_id
                     ],
                 )?;
@@ -1129,10 +1131,11 @@ fn run_full_scan(
                 added: outcome.added,
                 updated: outcome.updated,
                 missing: outcome.missing,
-                warning_count: warnings.total(),
+                warning_count: warning_total,
                 root_loose_files: warnings.root_loose_files,
                 truncated_with_version_dirs: warnings.truncated_with_version_dirs,
                 enum_failed: warnings.enum_failed,
+                anchor_failed: anchor_report.failed,
                 scope: ScanScope::Full,
             };
             let _ = app.emit("scan://finished", &summary);
@@ -1204,7 +1207,9 @@ fn run_single_scan(
     match store::apply_single(&db, game_id, &game) {
         Ok(outcome) => {
             // v2.1：单档案重扫同样补写/校验锚点（用户手删锚点时靠这里恢复）
-            let _ = anchor::sync_repository(&db, Path::new(&root), repository_id);
+            let anchor_report = anchor::sync_repository(&db, Path::new(&root), repository_id)
+                .unwrap_or_default();
+            let warning_total = warnings.total() + anchor_report.failed;
             let _ = db.with(|conn| {
                 conn.execute(
                     "UPDATE repositories SET last_scan_at=?1, is_offline=0 WHERE id=?2",
@@ -1213,7 +1218,7 @@ fn run_single_scan(
                 conn.execute(
                     "UPDATE scan_jobs SET status='done', finished_at=?1, found_count=1, warning_count=?2
                      WHERE repository_id=?3 AND status IN ('running','paused')",
-                    params![Db::now(), warnings.total() as i64, repository_id],
+                    params![Db::now(), warning_total as i64, repository_id],
                 )?;
                 Ok(())
             });
@@ -1224,10 +1229,11 @@ fn run_single_scan(
                 added: outcome.added,
                 updated: outcome.updated,
                 missing: outcome.missing,
-                warning_count: warnings.total(),
+                warning_count: warning_total,
                 root_loose_files: warnings.root_loose_files,
                 truncated_with_version_dirs: warnings.truncated_with_version_dirs,
                 enum_failed: warnings.enum_failed,
+                anchor_failed: anchor_report.failed,
                 scope: ScanScope::Single,
             };
             let _ = app.emit("scan://finished", &summary);

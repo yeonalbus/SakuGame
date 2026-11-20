@@ -27,6 +27,7 @@ const lastWarnings = ref<{
   root_loose_files: number;
   truncated_with_version_dirs: number;
   enum_failed: number;
+  anchor_failed: number;
 } | null>(null);
 
 const form = reactive({ drive: "", ip: "", host: "" });
@@ -116,7 +117,7 @@ const pct = computed(() => {
 const warningTotal = computed(() => {
   const w = lastWarnings.value;
   if (!w) return 0;
-  return w.root_loose_files + w.truncated_with_version_dirs + w.enum_failed;
+  return w.root_loose_files + w.truncated_with_version_dirs + w.enum_failed + w.anchor_failed;
 });
 
 /** 黑名单收纳层：以档案为顶层折叠显示（"RJ123/" 仅作视觉归纳，不承担功能） */
@@ -343,6 +344,7 @@ onMounted(async () => {
         root_loose_files: s.root_loose_files,
         truncated_with_version_dirs: s.truncated_with_version_dirs,
         enum_failed: s.enum_failed,
+        anchor_failed: s.anchor_failed,
       };
       void loadRepos();
       const scopeText = s.scope === "single" ? "（单档案）" : "";
@@ -492,6 +494,10 @@ onUnmounted(() => {
         </div>
         <div v-if="lastWarnings.enum_failed" class="warn-line">
           · {{ lastWarnings.enum_failed }} 个目录枚举失败（权限 / 长路径 / 网络）
+        </div>
+        <div v-if="lastWarnings.anchor_failed" class="warn-line">
+          · {{ lastWarnings.anchor_failed }} 个版本的 .SakuAnchor.json 写入失败（仓库只读 / 网络异常 / 权限），
+          该版本将退回仓库定位方式寻找路径
         </div>
       </div>
 

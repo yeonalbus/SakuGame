@@ -409,6 +409,8 @@ pub struct ScanSummary {
     pub root_loose_files: u32,
     pub truncated_with_version_dirs: u32,
     pub enum_failed: u32,
+    /// v2.1：锚点写入失败的版本数（只读盘 / 网络 / 权限）
+    pub anchor_failed: u32,
     pub scope: ScanScope,
 }
 
