@@ -1692,6 +1692,21 @@ pub fn set_version_user_path(
     if changed == 0 {
         return Err(AppError::VersionNotFound(version_id));
     }
+
+    // v2.1：路径变化后，该版本若停在「待确认 / 已中止」的回写任务，重新入队做一次检测，
+    // 让刚配好的用户目录按「全量新增」重新出现在候选里（方案：未配置→配置必定全失配）
+    let requeued = db.with(|conn| {
+        conn.execute(
+            "UPDATE transfer_tasks SET status='queued', stage='detect', updated_at=?1
+             WHERE version_id=?2 AND direction='writeback'
+               AND status IN ('waiting_confirm','paused')",
+            params![Db::now(), version_id],
+        )?;
+        Ok(conn.changes())
+    })?;
+    if requeued > 0 {
+        state.transfer.notify();
+    }
     Ok(())
 }
 

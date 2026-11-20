@@ -404,8 +404,10 @@ async function saveDrawer() {
     if (name !== v.display_name || note !== (v.note ?? null)) {
       await api.updateVersion(v.id, name, note);
     }
+    let pathChanged = false;
     if (drawerUserPath.value.trim() !== (v.user_path ?? "")) {
       await api.setVersionUserPath(v.id, drawerUserPath.value.trim() || null);
+      pathChanged = true;
     }
     if (drawerExeId.value !== null) {
       const target = v.executables.find((e) => e.id === drawerExeId.value);
@@ -415,6 +417,14 @@ async function saveDrawer() {
     }
     await load();
     await loadAlter(v);
+    // 路径变化会触发后端重新检测：关掉旧候选弹窗，等 transfer://state 带着新候选自动再弹
+    if (pathChanged && dialogOpen.value) {
+      const t = versionStates.value[v.id]?.task;
+      if (t && t.task_id === dialogTaskId.value) {
+        dialogOpen.value = false;
+        emit("toast", "用户路径已保存，正在重新检测变更组");
+      }
+    }
     closeDrawer();
     emit("toast", "版本配置已保存");
   } catch (e) {

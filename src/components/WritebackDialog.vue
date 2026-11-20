@@ -212,7 +212,8 @@ async function cancel() {
             用户路径不可达：{{ plan.user_path }}，已跳过用户目录检测
           </div>
           <div v-if="!plan.baseline_ready" class="wb-warn">
-            该版本没有 mtime 基线（v2.1 之前的旧缓存），只能依赖变更组记录判断变动
+            该版本未建立 mtime 基线（v2.1 之前的旧缓存）：游戏本体内的变动无法检测，
+            建议先取消并重新搬运一次（搬运会建立基线）。用户路径若已配置，本次仍会列出其全部文件。
           </div>
           <div v-if="requiredCount > 0" class="wb-note">
             已有变更组文件内容变更 {{ requiredCount }} 个，将自动回写且不可取消勾选

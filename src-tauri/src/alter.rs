@@ -314,7 +314,11 @@ pub fn detect(db: &Db, version_id: i64) -> AppResult<WritebackCandidates> {
     let alter_rows = load_alter_files(db, version_id)?;
     let baseline = load_baseline(db, version_id)?;
     let alter_ready = !alter_rows.is_empty();
-    let baseline_ready = !baseline.is_empty();
+    // 基线按 scope 分开判：BG 缺基线时不做全量比对（否则整个游戏几十 GB 全被判变动）；
+    // UD 缺基线且路径可用时，当前用户目录全部文件按「新增」进候选（方案：未配置→配置必定全失配）
+    let bg_baseline_ready = baseline.keys().any(|(scope, _)| scope == "bg");
+    let ud_baseline_ready = baseline.keys().any(|(scope, _)| scope == "ud");
+    let baseline_ready = bg_baseline_ready;
 
     let bg_now = scan_files(&version_root, Some(ALTER_DIR))?;
     let ud_now = if up_state == "ok" {
@@ -355,14 +359,13 @@ pub fn detect(db: &Db, version_id: i64) -> AppResult<WritebackCandidates> {
         }
     }
 
-    // 2) mtime 宽松口径：基线比对（无基线时整段跳过）
-    if baseline_ready {
+    // 2) mtime 宽松口径：BG（无 bg 基线时整段跳过，避免把整个游戏判成变动）
+    if bg_baseline_ready {
         for ((scope, rel), (b_size, b_mtime)) in &baseline {
-            if scope == "ud" && up_state != "ok" {
+            if scope != "bg" {
                 continue;
             }
-            let current = find_file(&bg_now, &ud_now, scope, rel);
-            match current {
+            match find_file(&bg_now, &ud_now, scope, rel) {
                 Some(f) => {
                     if f.size_bytes != *b_size || f.mtime_ms != *b_mtime {
                         let entry = map
@@ -376,7 +379,7 @@ pub fn detect(db: &Db, version_id: i64) -> AppResult<WritebackCandidates> {
                 None => deleted.push(format!("{scope}:{rel}")),
             }
         }
-        // 3) 基线里没有的当前文件 → 新增
+        // 基线里没有的当前 BG 文件 → 新增
         for f in &bg_now {
             if !baseline.contains_key(&("bg".to_string(), f.rel_path.clone())) {
                 let entry = map
@@ -387,13 +390,33 @@ pub fn detect(db: &Db, version_id: i64) -> AppResult<WritebackCandidates> {
                 }
             }
         }
+    }
+
+    // 3) mtime 宽松口径：UD（路径可用即比对；无 ud 基线 → 当前文件全量新增，对齐方案例子）
+    if up_state == "ok" {
         for f in &ud_now {
-            if !baseline.contains_key(&("ud".to_string(), f.rel_path.clone())) {
+            let key = ("ud".to_string(), f.rel_path.clone());
+            let changed = match baseline.get(&key) {
+                None => true,
+                Some((b_size, b_mtime)) => f.size_bytes != *b_size || f.mtime_ms != *b_mtime,
+            };
+            if changed {
                 let entry = map
-                    .entry(("ud".to_string(), f.rel_path.clone()))
+                    .entry(key)
                     .or_insert_with(|| candidate_from(f, "ud", &f.rel_path));
                 if !entry.reason.iter().any(|r| r == "mtime") {
                     entry.reason.push("mtime".into());
+                }
+            }
+        }
+        // 相对 ud 基线的删除项（仅在有基线时才有意义）
+        if ud_baseline_ready {
+            for (scope, rel) in baseline.keys() {
+                if scope != "ud" {
+                    continue;
+                }
+                if find_file(&bg_now, &ud_now, scope, rel).is_none() {
+                    deleted.push(format!("{scope}:{rel}"));
                 }
             }
         }
@@ -1152,6 +1175,46 @@ mod tests {
         assert!(
             !c.files.iter().any(|f| f.rel_path.starts_with(ALTER_DIR)),
             "SakuAlter 自身不得进入候选"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// T21-26：旧缓存（无任何基线）+ 刚配置用户路径 → 用户目录全量进候选，游戏本体不出候选
+    #[test]
+    fn detect_ud_full_without_baseline() {
+        let (db, base) = seed_db("udnobase");
+        let vroot = base.join("pool").join("R01").join("G").join("Ver");
+        std::fs::create_dir_all(&vroot).unwrap();
+        std::fs::write(vroot.join("a.dat"), b"A").unwrap();
+
+        let up = base.join("user");
+        std::fs::create_dir_all(up.join("file")).unwrap();
+        std::fs::write(up.join("Player.log"), b"1").unwrap();
+        std::fs::write(up.join("file").join("prev.log"), b"2").unwrap();
+        db.with(|c| {
+            c.execute(
+                "UPDATE game_versions SET user_path=?1 WHERE id=1",
+                params![up.to_string_lossy().to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let c = detect(&db, 1).unwrap();
+        assert!(!c.baseline_ready, "未建立 BG 基线时应为 false");
+        assert_eq!(c.user_path_state, "ok");
+        let uds: Vec<&str> = c
+            .files
+            .iter()
+            .filter(|f| f.scope == "ud")
+            .map(|f| f.rel_path.as_str())
+            .collect();
+        assert!(uds.contains(&"Player.log"), "用户目录文件应全量进候选: {uds:?}");
+        assert!(uds.contains(&"file/prev.log"), "子目录文件也应进候选: {uds:?}");
+        assert!(
+            c.files.iter().all(|f| f.scope != "bg"),
+            "无 BG 基线时不得把整个游戏本体判成变动"
         );
 
         let _ = std::fs::remove_dir_all(&base);
