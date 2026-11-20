@@ -72,7 +72,8 @@ button.danger {
   border-color: #4a2a2a;
 }
 
-input {
+/* 文本框样式；单选 / 复选保持原生外观（不能用输入框的 padding/border/宽度） */
+input:not([type="radio"]):not([type="checkbox"]) {
   font-family: inherit;
   font-size: 13px;
   color: var(--text);
@@ -83,8 +84,19 @@ input {
   outline: none;
 }
 
-input:focus {
+input:not([type="radio"]):not([type="checkbox"]):focus {
   border-color: var(--accent-dim);
+}
+
+input[type="radio"],
+input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  padding: 0;
+  flex-shrink: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
 }
 
 /* 布局 */
@@ -2167,6 +2179,7 @@ button.danger-solid:hover:not(:disabled) {
 .drawer-body {
   flex: 1;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 18px 20px;
   display: flex;
   flex-direction: column;
@@ -2191,7 +2204,7 @@ button.danger-solid:hover:not(:disabled) {
   color: var(--text-dim);
 }
 
-.drawer-field input,
+.drawer-field input:not([type="radio"]):not([type="checkbox"]),
 .drawer-field textarea {
   width: 100%;
   background: var(--bg);
@@ -2204,7 +2217,7 @@ button.danger-solid:hover:not(:disabled) {
   resize: none;
 }
 
-.drawer-field input:focus,
+.drawer-field input:not([type="radio"]):not([type="checkbox"]):focus,
 .drawer-field textarea:focus {
   outline: none;
   border-color: var(--accent-dim);
@@ -2247,6 +2260,7 @@ button.danger-solid:hover:not(:disabled) {
 .exe-option-text {
   min-width: 0;
   flex: 1;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   gap: 2px;
