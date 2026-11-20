@@ -8,15 +8,17 @@ use std::time::{Duration, Instant};
 use rusqlite::{params, Connection, OptionalExtension};
 use tauri::{AppHandle, Emitter, State};
 
+use crate::alter;
+use crate::anchor;
 use crate::cache;
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
 use crate::locator;
 use crate::models::{
-    BlocklistRow, CacheConfig, CacheUsage, ExecutableRow, ExeCandidate, GameDetail, GameRow,
-    GameVersionRow, LocatorKind, NewRepository, RepositoryDeletePreview, RepositoryLocator,
-    RepositoryRow, ScanPhase, ScanProgress, ScanScope, ScanSummary, TransferPreflight,
-    TransferTaskView, UnblockOutcome, VersionState,
+    AlterRef, AlterSummary, BlocklistRow, CacheConfig, CacheUsage, ExecutableRow, ExeCandidate,
+    GameDetail, GameRow, GameVersionRow, LocatorKind, NewRepository, RepositoryDeletePreview,
+    RepositoryLocator, RepositoryRow, ScanPhase, ScanProgress, ScanScope, ScanSummary,
+    TransferPreflight, TransferTaskView, UnblockOutcome, VersionState, WritebackCandidates,
 };
 use crate::scanner::{self, ScanConfig, ScanControl};
 use crate::state::{ActiveScan, AppState, ScanSlot};
@@ -1044,7 +1046,9 @@ fn run_full_scan(
     start_index: u32,
     root: String,
 ) {
-    let config = load_scan_config(&db);
+    let mut config = load_scan_config(&db);
+    // v2.1：全库扫描允许按锚点跳过未变化的版本；单档案 / 续扫传空 map（强制重扫）
+    config.known_anchors = anchor::load_anchor_map(&db, repository_id);
     let mut last_emit = Instant::now();
     let mut last_saved = 0u32;
 
@@ -1095,6 +1099,8 @@ fn run_full_scan(
         start_index == 0,
     ) {
         Ok(outcome) => {
+            // v2.1：落库后同步锚点（只处理已存在 SakuAlter 的版本；失败不影响扫描结果）
+            let _ = anchor::sync_repository(&db, Path::new(&root), repository_id);
             let _ = db.with(|conn| {
                 conn.execute(
                     "DELETE FROM scan_checkpoints WHERE repository_id=?1",
@@ -1197,6 +1203,8 @@ fn run_single_scan(
 
     match store::apply_single(&db, game_id, &game) {
         Ok(outcome) => {
+            // v2.1：单档案重扫同样补写/校验锚点（用户手删锚点时靠这里恢复）
+            let _ = anchor::sync_repository(&db, Path::new(&root), repository_id);
             let _ = db.with(|conn| {
                 conn.execute(
                     "UPDATE repositories SET last_scan_at=?1, is_offline=0 WHERE id=?2",
@@ -1254,7 +1262,7 @@ fn map_game_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<GameRow> {
 fn load_versions(conn: &Connection, game_id: i64) -> AppResult<Vec<GameVersionRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, game_id, relative_path, version_label, display_name, note, game_type,
-                size_bytes, source, status, updated_at
+                size_bytes, source, status, updated_at, user_path
          FROM game_versions WHERE game_id=?1
          ORDER BY version_label COLLATE NOCASE ASC",
     )?;
@@ -1272,6 +1280,7 @@ fn load_versions(conn: &Connection, game_id: i64) -> AppResult<Vec<GameVersionRo
                 source: r.get(8)?,
                 status: r.get(9)?,
                 updated_at: r.get(10)?,
+                user_path: r.get(11)?,
                 executables: Vec::new(),
             })
         })?
@@ -1540,16 +1549,15 @@ pub fn get_cache_usage(state: State<'_, AppState>) -> AppResult<CacheUsage> {
     cache::usage(&state.db)
 }
 
-/// 点搬运前的即时判（纯读，不预留）
+/// 点搬运前的即时判（纯读，不预留）。v2.1：源路径由锚点定位。
 #[tauri::command]
 pub fn preflight_transfer(
     state: State<'_, AppState>,
     version_id: i64,
 ) -> AppResult<TransferPreflight> {
     let db = &state.db;
-    let meta = cache::load_version_meta(db, version_id)?;
-    let root = resolve_repository(db, meta.repository_id)?;
-    cache::preflight(db, version_id, Path::new(&root))
+    let version_root = anchor::resolve_version_root(db, version_id)?;
+    cache::preflight(db, version_id, &version_root)
 }
 
 // ---------------------------------------------------------------------------
@@ -1558,10 +1566,7 @@ pub fn preflight_transfer(
 
 #[tauri::command]
 pub fn start_transfer(state: State<'_, AppState>, version_id: i64) -> AppResult<i64> {
-    let db = &state.db;
-    let meta = cache::load_version_meta(db, version_id)?;
-    let root = resolve_repository(db, meta.repository_id)?;
-    transfer::start_transfer(&state.transfer, Path::new(&root), version_id)
+    transfer::start_transfer(&state.transfer, version_id)
 }
 
 #[tauri::command]
@@ -1580,7 +1585,7 @@ pub fn get_version_transfer(
         Ok(conn
             .query_row(
                 "SELECT id FROM transfer_tasks WHERE version_id=?1
-                 AND status IN ('queued','running','paused','error') ORDER BY id DESC LIMIT 1",
+                 AND status IN ('queued','running','paused','waiting_confirm','error') ORDER BY id DESC LIMIT 1",
                 params![version_id],
                 |r| r.get(0),
             )
@@ -1610,9 +1615,93 @@ pub fn retry_transfer(state: State<'_, AppState>, task_id: i64) -> AppResult<i64
 }
 
 /// 从缓存池移除（只删池内副本）
+///
+/// v2.1 起「移出缓存」走 `start_writeback`（先检测变更组再确认）；
+/// 本命令保留给无变更组需求的强制清理，前端不再默认调用。
 #[tauri::command]
 pub fn remove_cache(state: State<'_, AppState>, version_id: i64) -> AppResult<()> {
     cache::remove_cache(&state.db, version_id)
+}
+
+// ---------------------------------------------------------------------------
+// v2.1：变更组 / 回写 / 用户路径
+// ---------------------------------------------------------------------------
+
+/// 启动回写流程：建 writeback 任务 → 调度器执行检测 → 停在 `waiting_confirm`
+#[tauri::command]
+pub fn start_writeback(state: State<'_, AppState>, version_id: i64) -> AppResult<i64> {
+    transfer::start_writeback(&state.transfer, version_id)
+}
+
+/// 读取已落盘的检测候选（不重扫；`waiting_confirm` 时前端用它渲染勾选树）
+#[tauri::command]
+pub fn get_writeback_plan(
+    state: State<'_, AppState>,
+    task_id: i64,
+) -> AppResult<WritebackCandidates> {
+    alter::plan_view(&state.db, task_id)
+}
+
+/// 确认回写：`selection` 必须覆盖全部 `required`（缺失时后端自动补上）
+#[tauri::command]
+pub fn confirm_writeback(
+    state: State<'_, AppState>,
+    task_id: i64,
+    selection: Vec<AlterRef>,
+) -> AppResult<()> {
+    alter::confirm(&state.db, task_id, &selection)?;
+    state.transfer.notify();
+    Ok(())
+}
+
+/// 中止回写：任务停在 paused，游戏与已提取存档原样保留（绝不删任务）
+#[tauri::command]
+pub fn abort_writeback(state: State<'_, AppState>, task_id: i64) -> AppResult<()> {
+    alter::abort(&state.db, task_id)
+}
+
+/// 设置 / 清空版本的用户目录（SakuAlter/UD 的追踪目标）
+#[tauri::command]
+pub fn set_version_user_path(
+    state: State<'_, AppState>,
+    version_id: i64,
+    path: Option<String>,
+) -> AppResult<()> {
+    let db = &state.db;
+    let cleaned = path
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    if let Some(p) = cleaned.as_deref() {
+        let pp = Path::new(p);
+        if !pp.is_absolute() {
+            return Err(AppError::UserPathInvalid("必须填写绝对路径".into()));
+        }
+        if !pp.is_dir() {
+            return Err(AppError::UserPathInvalid(format!(
+                "目录不存在或不可访问：{p}"
+            )));
+        }
+    }
+    let changed = db.with(|conn| {
+        conn.execute(
+            "UPDATE game_versions SET user_path=?1, updated_at=?2 WHERE id=?3",
+            params![cleaned, Db::now(), version_id],
+        )?;
+        Ok(conn.changes())
+    })?;
+    if changed == 0 {
+        return Err(AppError::VersionNotFound(version_id));
+    }
+    Ok(())
+}
+
+/// 变更组摘要（详情页配置抽屉：文件数 / 字节 / 锚点 / 基线 / 用户路径状态）
+#[tauri::command]
+pub fn get_alter_summary(
+    state: State<'_, AppState>,
+    version_id: i64,
+) -> AppResult<AlterSummary> {
+    alter::summary(&state.db, version_id)
 }
 
 /// 详情页按钮态机：一次拿该档案下所有版本的缓存与任务状态
@@ -1642,7 +1731,7 @@ pub fn get_version_states(
             let task_id: Option<i64> = conn
                 .query_row(
                     "SELECT id FROM transfer_tasks WHERE version_id=?1
-                     AND status IN ('queued','running','paused','error')
+                     AND status IN ('queued','running','paused','waiting_confirm','error')
                      ORDER BY id DESC LIMIT 1",
                     params![vid],
                     |r| r.get(0),

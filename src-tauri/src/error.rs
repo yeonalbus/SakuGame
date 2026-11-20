@@ -80,6 +80,16 @@ pub enum AppError {
     #[error("启动失败: {0}")]
     LaunchFailed(String),
 
+    // ---- v2.1：变更组 / 锚点 ----
+    #[error("该任务不在待确认状态，无法确认回写（{0}）")]
+    WritebackNotConfirmable(String),
+
+    #[error("用户路径无效: {0}")]
+    UserPathInvalid(String),
+
+    #[error("找不到该版本的可达路径（version_uuid={0}），请重新扫描仓库")]
+    AnchorUnresolved(String),
+
     #[error("内部错误: {0}")]
     Internal(String),
 }
@@ -117,6 +127,9 @@ impl Serialize for AppError {
             AppError::CachePathLocked => "cache_path_locked",
             AppError::LaunchNoExecutable => "launch_no_executable",
             AppError::LaunchFailed(_) => "launch_failed",
+            AppError::WritebackNotConfirmable(_) => "writeback_not_confirmable",
+            AppError::UserPathInvalid(_) => "user_path_invalid",
+            AppError::AnchorUnresolved(_) => "anchor_unresolved",
             AppError::Internal(_) => "internal",
         };
         let mut s = serializer.serialize_struct("AppError", 2)?;

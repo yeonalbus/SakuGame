@@ -35,6 +35,9 @@ pub struct ScanConfig {
     pub exclude_path_segments: Vec<String>,
     /// 仓库根级目录排除（小写；支持结尾 `*` 前缀通配）
     pub root_excluded_dirs: Vec<String>,
+    /// v2.1：版本相对路径 → version_uuid（DB 已有版本）。
+    /// 命中且锚点一致时跳过该版本的客观字段重扫；空 = 不做增量跳过（单档案重扫 / 档案重扫）。
+    pub known_anchors: HashMap<String, String>,
     part_matchers: Vec<PartMatcher>,
 }
 
@@ -139,6 +142,7 @@ impl Default for ScanConfig {
             exclude_file_patterns,
             exclude_path_segments,
             root_excluded_dirs,
+            known_anchors: HashMap::new(),
             part_matchers,
         }
     }
@@ -397,6 +401,7 @@ fn classify_game(
             size_bytes: size,
             executables: direct_exes,
             archive_groups: build_archive_groups(config, &direct_archives),
+            skipped: false,
         };
 
         // 截断可见性：子目录里还藏着 exe / 压缩包 → 计一条 warning（判定结果不变）
@@ -422,6 +427,22 @@ fn classify_game(
     let mut versions = Vec::new();
     for sub in entries.iter().filter(|e| e.is_dir && !e.reparse) {
         let sub_rel = format!("{}/{}", rel, sub.name);
+        // v2.1 增量跳过：DB 已有该版本，且锚点 version_uuid 一致 → 只占位，不重扫客观字段
+        if let Some(uuid) = config.known_anchors.get(&sub_rel) {
+            let anchor = crate::anchor::read_anchor(&crate::anchor::anchor_path(&sub.path));
+            if anchor.map(|a| &a.version_uuid == uuid).unwrap_or(false) {
+                versions.push(VersionEntry {
+                    relative_path: sub_rel,
+                    version_label: sub.name.clone(),
+                    game_type: GameType::Folder,
+                    size_bytes: 0,
+                    executables: Vec::new(),
+                    archive_groups: Vec::new(),
+                    skipped: true,
+                });
+                continue;
+            }
+        }
         let sub_entries = match list_dir(&extend_path(&sub.path)) {
             Ok(v) => v,
             Err(_) => {
@@ -446,6 +467,7 @@ fn classify_game(
             size_bytes: size,
             executables: s_exes,
             archive_groups: build_archive_groups(config, &s_archives),
+            skipped: false,
         });
     }
 

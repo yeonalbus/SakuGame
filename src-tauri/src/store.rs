@@ -79,6 +79,8 @@ pub fn apply_report(
                 seen.insert(v.relative_path.clone());
                 upsert_version(&tx, game_id, v, &now)?;
             }
+            // v2.1：增量跳过的版本 size 保持 DB 原值 → 档案大小必须由版本汇总，不能用 entry.size_bytes
+            refresh_game_size(&tx, game_id, &now)?;
             seen_versions.insert(g.relative_path.clone(), seen);
         }
 
@@ -145,6 +147,7 @@ pub fn apply_single(db: &Db, game_id: i64, entry: &GameEntry) -> AppResult<Apply
             seen.insert(v.relative_path.clone());
             upsert_version(&tx, gid, v, &now)?;
         }
+        refresh_game_size(&tx, gid, &now)?;
         out.missing += mark_missing_versions(&tx, gid, &seen, &blocked, &now)?;
 
         repair_selected_versions(&tx)?;
@@ -235,6 +238,14 @@ fn upsert_version(
         .optional()?;
 
     let version_id = match existing {
+        Some(id) if v.skipped => {
+            // v2.1 增量跳过：锚点一致，只把状态拉回 ok；客观字段与 exe 候选一律不动
+            tx.execute(
+                "UPDATE game_versions SET status='ok', updated_at=?1 WHERE id=?2",
+                params![now, id],
+            )?;
+            return Ok(id);
+        }
         Some(id) => {
             // version_label 跟随目录原名刷新；display_name / note / source 不动
             tx.execute(
@@ -271,6 +282,18 @@ fn upsert_version(
     replace_scan_executables(tx, version_id, &v.executables, now)?;
     replace_version_files(tx, version_id, &v.archive_groups)?;
     Ok(version_id)
+}
+
+/// 档案大小 = 各版本 size 之和（v2.1：增量跳过的版本 size 保持 DB 原值，故不能直接用扫描结果）
+fn refresh_game_size(tx: &Transaction<'_>, game_id: i64, now: &str) -> AppResult<()> {
+    tx.execute(
+        "UPDATE games SET
+            size_bytes = (SELECT COALESCE(SUM(size_bytes),0) FROM game_versions WHERE game_id=?1),
+            updated_at = ?2
+         WHERE id=?1",
+        params![game_id, now],
+    )?;
+    Ok(())
 }
 
 /// 刷新扫描来源的可执行文件候选；保留用户选择与手填项（§6）
@@ -495,6 +518,7 @@ mod tests {
                     size_bytes: 100,
                 }],
                 archive_groups: Vec::new(),
+                skipped: false,
             }],
         }
     }
@@ -518,6 +542,7 @@ mod tests {
                         size_bytes: 100,
                     }],
                     archive_groups: Vec::new(),
+                    skipped: false,
                 })
                 .collect(),
         }
@@ -543,6 +568,7 @@ mod tests {
                         part_index: Some(1),
                     }],
                 }],
+                skipped: false,
             }],
         }
     }

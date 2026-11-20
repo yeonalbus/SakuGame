@@ -1,4 +1,6 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+pub mod alter;
+pub mod anchor;
 pub mod cache;
 pub mod commands;
 pub mod db;
@@ -23,6 +25,10 @@ pub fn run() {
             let db = db::Db::open(&data_dir.join("sakugame.db"))?;
             // v2：启动对账（缓存记录 vs 池内目录）+ 未完成任务转暂停
             let _ = cache::reconcile(&db);
+            // v2.1：先恢复回写包（writeback 的 running 收尾为 error），再走 v2 的 running → paused
+            if let Ok(pool) = cache::pool_root(&db) {
+                let _ = alter::recover_on_startup(&db, &pool);
+            }
             let _ = transfer::recover_on_startup(&db);
             let state = state::AppState::new(db);
             let engine = state.transfer.clone();
@@ -67,6 +73,12 @@ pub fn run() {
             commands::cancel_transfer,
             commands::retry_transfer,
             commands::remove_cache,
+            commands::start_writeback,
+            commands::get_writeback_plan,
+            commands::confirm_writeback,
+            commands::abort_writeback,
+            commands::set_version_user_path,
+            commands::get_alter_summary,
             commands::get_version_states,
             commands::launch_game,
             commands::get_repository_delete_preview,

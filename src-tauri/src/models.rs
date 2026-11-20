@@ -178,6 +178,8 @@ pub struct VersionEntry {
     pub size_bytes: u64,
     pub executables: Vec<ExeCandidate>,
     pub archive_groups: Vec<ArchiveGroup>,
+    /// v2.1：锚点一致，本次跳过客观字段重扫（入库时只刷 status / updated_at）
+    pub skipped: bool,
 }
 
 /// 扫描判定出的一个游戏档案（= 游戏标识层，一层一条）
@@ -357,6 +359,8 @@ pub struct GameVersionRow {
     /// scan / manual
     pub source: String,
     pub status: String,
+    /// v2.1：用户目录绝对路径（SakuAlter/UD 追踪目标）；None = 未配置
+    pub user_path: Option<String>,
     pub executables: Vec<ExecutableRow>,
     pub updated_at: String,
 }
@@ -447,6 +451,8 @@ pub enum TransferStatus {
     Queued,
     Running,
     Paused,
+    /// v2.1：回写检测完成、等待用户勾选待回写文件（不占并发额度）
+    WaitingConfirm,
     Error,
     Done,
 }
@@ -457,6 +463,7 @@ impl TransferStatus {
             TransferStatus::Queued => "queued",
             TransferStatus::Running => "running",
             TransferStatus::Paused => "paused",
+            TransferStatus::WaitingConfirm => "waiting_confirm",
             TransferStatus::Error => "error",
             TransferStatus::Done => "done",
         }
@@ -467,6 +474,7 @@ impl TransferStatus {
             "queued" => Some(TransferStatus::Queued),
             "running" => Some(TransferStatus::Running),
             "paused" => Some(TransferStatus::Paused),
+            "waiting_confirm" => Some(TransferStatus::WaitingConfirm),
             "error" => Some(TransferStatus::Error),
             "done" => Some(TransferStatus::Done),
             _ => None,
@@ -510,6 +518,12 @@ pub struct TransferTaskView {
     pub repo_no: String,
     pub game_name: String,
     pub version_label: String,
+    /// 方向：pull（仓库→池）/ writeback（池→仓库 SakuAlter）
+    pub direction: String,
+    /// 阶段键（v2.1）：transfer / inject / baseline / detect / waiting_confirm / extract / clean / store
+    pub stage: Option<String>,
+    /// 该任务占用的并发额度（v2.1 并发池展示）
+    pub concurrency: i64,
     pub total_bytes: i64,
     pub written_bytes: i64,
     pub total_files: i64,
@@ -549,6 +563,100 @@ pub struct VersionState {
     pub cached: bool,
     /// 记录在但池内目录已失效
     pub cache_missing: bool,
-    /// 当前任务（排队/搬运/暂停/出错）
+    /// 当前任务（排队/搬运/暂停/出错/回写检测中…）
     pub task: Option<TransferTaskView>,
+}
+
+// ---------------------------------------------------------------------------
+// v2.1 变更组 / 锚点
+// 依据：DSPlans/Specs/MVPv2.1技术规格.md §3
+// ---------------------------------------------------------------------------
+
+/// `.SakuAnchor.json` 内容（版本层身份指纹）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SakuAnchor {
+    /// 生成时的应用版本（留痕，不做兼容判断）
+    pub schema_version: String,
+    pub game_uuid: String,
+    pub version_uuid: String,
+    /// Unix 秒
+    pub created_at: i64,
+}
+
+/// 变更组文件引用（勾选确认 / 回写清单共用）
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AlterRef {
+    /// bg / ud
+    pub scope: String,
+    pub rel_path: String,
+}
+
+/// 勾选树叶子
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateFile {
+    /// bg / ud
+    pub scope: String,
+    /// bg：相对版本层根；ud：相对 user_path
+    pub rel_path: String,
+    pub size_bytes: i64,
+    pub mtime_ms: i64,
+    /// 命中原因：hash / mtime（可同时命中）
+    pub reason: Vec<String>,
+    /// true = 已有变更组文件 hash 失配，必须回写且不可取消勾选
+    pub required: bool,
+}
+
+/// 移出缓存前的候选集合
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WritebackCandidates {
+    pub version_id: i64,
+    pub game_name: String,
+    pub version_label: String,
+    pub files: Vec<CandidateFile>,
+    /// 相对基线被删除的路径（仅展示，不参与回写）
+    pub deleted: Vec<String>,
+    pub user_path: Option<String>,
+    /// ok / unset / unreachable
+    pub user_path_state: String,
+    /// false = 无基线（v2.1 之前的旧缓存），mtime 部分跳过
+    pub baseline_ready: bool,
+    /// false = 无变更组记录，hash 部分跳过
+    pub alter_ready: bool,
+}
+
+/// 变更组摘要（详情页展示）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlterSummary {
+    pub version_id: i64,
+    pub bg_count: i64,
+    pub ud_count: i64,
+    pub bytes: i64,
+    /// ok / missing / drift / none
+    pub anchor_state: String,
+    pub baseline_ready: bool,
+    /// ok / unset / unreachable
+    pub user_path_state: String,
+    pub user_path: Option<String>,
+}
+
+/// `.waiting/<task_id>/manifest.json`（回写包）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WritebackManifest {
+    pub schema: i64,
+    pub task_id: i64,
+    pub version_id: i64,
+    pub repository_id: i64,
+    pub game_rel: String,
+    pub version_rel: String,
+    pub user_path: Option<String>,
+    pub created_at: String,
+    pub files: Vec<ManifestFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestFile {
+    pub scope: String,
+    pub rel_path: String,
+    pub hash: String,
+    pub size_bytes: i64,
 }

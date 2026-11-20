@@ -77,6 +77,10 @@ pub struct TaskRow {
     pub total_files: i64,
     pub concurrency: i64,
     pub status: String,
+    /// pull / writeback
+    pub direction: String,
+    /// 阶段键（v2.1）
+    pub stage: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -84,11 +88,8 @@ pub struct TaskRow {
 // ---------------------------------------------------------------------------
 
 /// 创建任务：先算体积（无锁），再在锁内做容量判定 + 预留 + 入队。
-pub fn start_transfer(
-    engine: &TransferEngine,
-    repository_root: &Path,
-    version_id: i64,
-) -> AppResult<i64> {
+/// v2.1：源定位交给锚点（`last_known_path` 快路径 → 全库锚点兜底 → locator 回退）。
+pub fn start_transfer(engine: &TransferEngine, version_id: i64) -> AppResult<i64> {
     let db = &engine.db;
     let meta = cache::load_version_meta(db, version_id)?;
 
@@ -106,7 +107,7 @@ pub fn start_transfer(
     }
 
     // 递归求和（源可达性在此暴露）
-    let src = join_rel(repository_root, &meta.version_rel);
+    let src = resolve_source_root(db, version_id)?;
     let (total_bytes, total_files) = cache::sum_tree(&src)?;
     let concurrency = pick_concurrency(total_files);
 
@@ -176,27 +177,96 @@ pub fn pick_concurrency(total_files: i64) -> i64 {
 
 pub fn spawn_scheduler(engine: Arc<TransferEngine>, app: AppHandle) {
     std::thread::spawn(move || loop {
-        let queued = match load_by_status(&engine.db, "queued") {
-            Ok(v) => v,
-            Err(_) => Vec::new(),
-        };
-        for task in queued {
-            let need = task.concurrency.max(1) as usize;
-            let used = engine.slots_used.load(Ordering::SeqCst);
-            if used + need > MAX_SLOTS {
-                continue;
-            }
-            if mark_running(&engine.db, task.id).is_err() {
-                continue;
-            }
-            engine.slots_used.fetch_add(need, Ordering::SeqCst);
-            spawn_task_thread(engine.clone(), app.clone(), task);
-        }
+        schedule_once(&engine, &app);
         // 等通知或 500ms 轮询
         let (lock, cv) = &*engine.wake;
         let guard = lock.lock().unwrap();
         let _ = cv.wait_timeout(guard, Duration::from_millis(500));
     });
+}
+
+/// 一轮调度：回写（writeback）优先，额度不足时抢占 running 的搬运任务（复用 paused）。
+fn schedule_once(engine: &Arc<TransferEngine>, app: &AppHandle) {
+    let queued = load_by_status(&engine.db, "queued").unwrap_or_default();
+    let (writebacks, pulls): (Vec<TaskRow>, Vec<TaskRow>) = queued
+        .into_iter()
+        .partition(|t| t.direction.as_str() == "writeback");
+
+    for task in writebacks {
+        let need = task.concurrency.max(1) as usize;
+        if !ensure_capacity(engine.as_ref(), need) {
+            continue;
+        }
+        if mark_running(&engine.db, task.id).is_err() {
+            continue;
+        }
+        engine.slots_used.fetch_add(need, Ordering::SeqCst);
+        spawn_task_thread(Arc::clone(engine), app.clone(), task);
+    }
+
+    for task in pulls {
+        let need = task.concurrency.max(1) as usize;
+        let used = engine.slots_used.load(Ordering::SeqCst);
+        if used + need > MAX_SLOTS {
+            continue;
+        }
+        if mark_running(&engine.db, task.id).is_err() {
+            continue;
+        }
+        engine.slots_used.fetch_add(need, Ordering::SeqCst);
+        spawn_task_thread(Arc::clone(engine), app.clone(), task);
+    }
+}
+
+/// 为回写腾出 `need` 个额度：按「占用最大、创建最晚」抢占 running 的搬运任务。
+/// 抢占 = 置 pause（文件边界生效），等其线程退出归还额度；单次最多等 30s。
+fn ensure_capacity(engine: &TransferEngine, need: usize) -> bool {
+    let mut rounds = 0;
+    loop {
+        let used = engine.slots_used.load(Ordering::SeqCst);
+        if used + need <= MAX_SLOTS {
+            return true;
+        }
+        rounds += 1;
+        if rounds > 8 {
+            return false;
+        }
+        let Some(victim) = pick_victim(engine) else {
+            return false;
+        };
+        if pause_task(engine, victim).is_err() {
+            return false;
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let still_running = engine.running.lock().unwrap().contains_key(&victim);
+            if !still_running {
+                break;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// 抢占候选：running 且方向为 pull；优先占额度最大、其次创建最晚（保护已跑很久的任务）
+fn pick_victim(engine: &TransferEngine) -> Option<i64> {
+    engine
+        .db
+        .with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM transfer_tasks WHERE status='running' AND direction='pull'
+                 ORDER BY concurrency DESC, created_at DESC, id DESC LIMIT 1",
+            )?;
+            let id: Option<i64> = stmt
+                .query_map([], |r| r.get(0))?
+                .filter_map(|r| r.ok())
+                .next();
+            Ok(id)
+        })
+        .unwrap_or(None)
 }
 
 fn mark_running(db: &Db, task_id: i64) -> AppResult<()> {
@@ -214,7 +284,7 @@ fn load_by_status(db: &Db, status: &str) -> AppResult<Vec<TaskRow>> {
     db.with(|conn| {
         let mut stmt = conn.prepare(
             "SELECT id, repository_id, game_id, version_id, repo_no, source_rel, dest_rel,
-                    total_bytes, total_files, concurrency, status
+                    total_bytes, total_files, concurrency, status, direction, stage
              FROM transfer_tasks WHERE status=?1 ORDER BY created_at ASC, id ASC",
         )?;
         let rows = stmt.query_map(params![status], |r| {
@@ -230,6 +300,8 @@ fn load_by_status(db: &Db, status: &str) -> AppResult<Vec<TaskRow>> {
                 total_files: r.get(8)?,
                 concurrency: r.get(9)?,
                 status: r.get(10)?,
+                direction: r.get(11)?,
+                stage: r.get(12)?,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -241,7 +313,7 @@ pub fn load_task(db: &Db, task_id: i64) -> AppResult<Option<TaskRow>> {
         let row = conn
             .query_row(
                 "SELECT id, repository_id, game_id, version_id, repo_no, source_rel, dest_rel,
-                        total_bytes, total_files, concurrency, status
+                        total_bytes, total_files, concurrency, status, direction, stage
                  FROM transfer_tasks WHERE id=?1",
                 params![task_id],
                 |r| {
@@ -257,6 +329,8 @@ pub fn load_task(db: &Db, task_id: i64) -> AppResult<Option<TaskRow>> {
                         total_files: r.get(8)?,
                         concurrency: r.get(9)?,
                         status: r.get(10)?,
+                        direction: r.get(11)?,
+                        stage: r.get(12)?,
                     })
                 },
             )
@@ -287,7 +361,11 @@ fn spawn_task_thread(engine: Arc<TransferEngine>, app: AppHandle, task: TaskRow)
     }
 
     std::thread::spawn(move || {
-        let result = run_task(&engine, Some(&app), &task, &pause, &cancel, concurrency);
+        let result = if task.direction.as_str() == "writeback" {
+            run_writeback_task(&engine, &app, &task)
+        } else {
+            run_task(&engine, Some(&app), &task, &pause, &cancel, concurrency)
+        };
         // 释放通道 + 注销
         engine.slots_used.fetch_sub(concurrency, Ordering::SeqCst);
         engine.running.lock().unwrap().remove(&task.id);
@@ -297,6 +375,34 @@ fn spawn_task_thread(engine: Arc<TransferEngine>, app: AppHandle, task: TaskRow)
         }
         engine.notify();
     });
+}
+
+/// 回写任务线程：`stage=detect` 先做检测并停在 `waiting_confirm`；
+/// `stage=extract` 起执行「提取 → 清理 → 存储」。
+fn run_writeback_task(
+    engine: &TransferEngine,
+    app: &AppHandle,
+    task: &TaskRow,
+) -> AppResult<()> {
+    let db = &engine.db;
+    let stage = task.stage.clone().unwrap_or_default();
+    if stage.is_empty() || stage == "detect" {
+        let candidates = crate::alter::detect(db, task.version_id)?;
+        let total_files = candidates.files.len() as i64;
+        let total_bytes: i64 = candidates.files.iter().map(|f| f.size_bytes).sum();
+        crate::alter::save_plan(db, task.id, task.version_id, &candidates)?;
+        db.with(|conn| {
+            conn.execute(
+                "UPDATE transfer_tasks SET status='waiting_confirm', stage='waiting_confirm',
+                    total_files=?1, total_bytes=?2, updated_at=?3 WHERE id=?4",
+                params![total_files, total_bytes, Db::now(), task.id],
+            )?;
+            Ok(())
+        })?;
+        emit_state(Some(app), task_view(db, task.id));
+        return Ok(());
+    }
+    crate::alter::run_writeback(Some(app), db, task.id)
 }
 
 fn run_task(
@@ -309,8 +415,7 @@ fn run_task(
 ) -> AppResult<()> {
     let db = &engine.db;
     let pool_root = cache::pool_root(db)?;
-    let repo_root = resolve_repo_root(db, task.repository_id)?;
-    let src = join_rel(&repo_root, &task.source_rel);
+    let src = resolve_source_root(db, task.version_id)?;
     let staging = pool_root.join(".staging").join(task.id.to_string());
     std::fs::create_dir_all(extend_path(&staging))?;
 
@@ -462,6 +567,17 @@ fn run_task(
     }
     std::fs::rename(extend_path(&staging), extend_path(&dest))?;
 
+    // ---- v2.1：变更组注入 + 初始 mtime 记录 ----
+    // 失败则回滚（删掉刚落地的缓存目录与半成品记录），回到「未搬运」状态可重试
+    if let Err(e) = post_process(db, app, task.id, task.version_id, &dest) {
+        let _ = std::fs::remove_dir_all(extend_path(&dest));
+        clear_alter_state(db, task.version_id);
+        let msg = format!("变更组注入 / 初始记录失败：{e}");
+        set_error(db, task.id, &msg, None);
+        emit_state(app, task_view(db, task.id));
+        return Ok(());
+    }
+
     // 写缓存记录 + 任务完成（同一事务）
     let now = Db::now();
     db.with_mut(|conn| {
@@ -494,6 +610,68 @@ fn run_task(
     })?;
     emit_state(app, task_view(db, task.id));
     Ok(())
+}
+
+/// v2.1 后处理：注入变更组 → 记录初始 mtime 基线。每步推一次状态。
+fn post_process(
+    db: &Db,
+    app: Option<&AppHandle>,
+    task_id: i64,
+    version_id: i64,
+    dest: &Path,
+) -> AppResult<()> {
+    let user_path = crate::alter::load_user_path(db, version_id)?;
+
+    set_stage(db, app, task_id, "inject")?;
+    let outcome =
+        crate::alter::inject(db, version_id, dest, user_path.as_deref())?;
+
+    // UD 没能注入且 SakuAlter/UD 下有文件 → 绝不静默丢档，直接报错回滚
+    if outcome.ud_state != "ok" {
+        let ud_dir = crate::anchor::alter_dir(dest).join(crate::anchor::UD_DIR);
+        let ud_files = crate::alter::scan_files(&ud_dir, None)?;
+        if !ud_files.is_empty() {
+            return Err(AppError::UserPathInvalid(format!(
+                "用户路径{}，SakuAlter/UD 下 {} 个文件无法注入；请在「配置」里填写用户目录后重试",
+                if outcome.ud_state == "unset" {
+                    "未配置"
+                } else {
+                    "不可达"
+                },
+                ud_files.len()
+            )));
+        }
+    }
+
+    set_stage(db, app, task_id, "baseline")?;
+    crate::alter::record_baseline(db, version_id, dest, user_path.as_deref())?;
+    Ok(())
+}
+
+fn set_stage(db: &Db, app: Option<&AppHandle>, task_id: i64, stage: &str) -> AppResult<()> {
+    db.with(|conn| {
+        conn.execute(
+            "UPDATE transfer_tasks SET stage=?1, updated_at=?2 WHERE id=?3",
+            params![stage, Db::now(), task_id],
+        )?;
+        Ok(())
+    })?;
+    emit_state(app, task_view(db, task_id));
+    Ok(())
+}
+
+fn clear_alter_state(db: &Db, version_id: i64) {
+    let _ = db.with(|conn| {
+        conn.execute(
+            "DELETE FROM alter_files WHERE version_id=?1",
+            params![version_id],
+        )?;
+        conn.execute(
+            "DELETE FROM mtime_baseline WHERE version_id=?1",
+            params![version_id],
+        )?;
+        Ok(())
+    });
 }
 
 fn worker_loop(
@@ -652,7 +830,12 @@ fn set_error(db: &Db, task_id: i64, msg: &str, failed: Option<&[String]>) {
     });
 }
 
-fn resolve_repo_root(db: &Db, repository_id: i64) -> AppResult<PathBuf> {
+/// v2.1：版本层根定位（锚点优先）。封装成一处，便于后续换定位策略。
+fn resolve_source_root(db: &Db, version_id: i64) -> AppResult<PathBuf> {
+    crate::anchor::resolve_version_root(db, version_id)
+}
+
+pub fn resolve_repo_root(db: &Db, repository_id: i64) -> AppResult<PathBuf> {
     let templates: Vec<String> = db.with(|conn| {
         let mut stmt = conn.prepare(
             "SELECT path_template FROM repository_locators WHERE repository_id=?1
@@ -680,7 +863,8 @@ pub fn task_view(db: &Db, task_id: i64) -> Option<TransferTaskView> {
             .query_row(
                 "SELECT t.id, t.repository_id, t.game_id, t.version_id, t.repo_no, g.display_name,
                         v.version_label, t.total_bytes, t.written_bytes, t.total_files,
-                        t.written_files, t.status, t.error_message, t.failed_files
+                        t.written_files, t.status, t.error_message, t.failed_files, t.direction, t.stage,
+                        t.concurrency
                  FROM transfer_tasks t
                  JOIN games g ON g.id = t.game_id
                  JOIN game_versions v ON v.id = t.version_id
@@ -697,6 +881,9 @@ pub fn task_view(db: &Db, task_id: i64) -> Option<TransferTaskView> {
                         repo_no: r.get(4)?,
                         game_name: r.get(5)?,
                         version_label: r.get(6)?,
+                        direction: r.get(14)?,
+                        stage: r.get(15)?,
+                        concurrency: r.get(16)?,
                         total_bytes: r.get(7)?,
                         written_bytes: r.get(8)?,
                         total_files: r.get(9)?,
@@ -722,7 +909,8 @@ pub fn list_tasks(db: &Db) -> AppResult<Vec<TransferTaskView>> {
         let mut stmt = conn.prepare(
             "SELECT t.id, t.repository_id, t.game_id, t.version_id, t.repo_no, g.display_name,
                     v.version_label, t.total_bytes, t.written_bytes, t.total_files,
-                    t.written_files, t.status, t.error_message, t.failed_files
+                    t.written_files, t.status, t.error_message, t.failed_files, t.direction, t.stage,
+                    t.concurrency
              FROM transfer_tasks t
              JOIN games g ON g.id = t.game_id
              JOIN game_versions v ON v.id = t.version_id
@@ -739,6 +927,9 @@ pub fn list_tasks(db: &Db) -> AppResult<Vec<TransferTaskView>> {
                 repo_no: r.get(4)?,
                 game_name: r.get(5)?,
                 version_label: r.get(6)?,
+                direction: r.get(14)?,
+                stage: r.get(15)?,
+                concurrency: r.get(16)?,
                 total_bytes: r.get(7)?,
                 written_bytes: r.get(8)?,
                 total_files: r.get(9)?,
@@ -754,6 +945,72 @@ pub fn list_tasks(db: &Db) -> AppResult<Vec<TransferTaskView>> {
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     })
+}
+
+/// v2.1：创建回写任务（`direction=writeback`，`stage=detect`）。
+/// 调度器启动后先做检测，完成后停在 `waiting_confirm` 并释放额度。
+pub fn start_writeback(engine: &TransferEngine, version_id: i64) -> AppResult<i64> {
+    let db = &engine.db;
+    let meta = cache::load_version_meta(db, version_id)?;
+    if meta.game_type == "archive" {
+        return Err(AppError::ArchiveUnsupported);
+    }
+    if !cache::is_cached(db, version_id)? {
+        return Err(AppError::InvalidInput("该版本不在缓存池中，无法移出".into()));
+    }
+    if cache::has_active_task(db, version_id)? {
+        return Err(AppError::TransferBusy);
+    }
+    let dest_rel: String = db.with(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT dest_rel FROM cache_entries WHERE version_id=?1 AND status='ok'",
+                params![version_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| AppError::InvalidInput("该版本不在缓存池中，无法移出".into()))?)
+    })?;
+
+    // 用基线规模估算档位（检测阶段不预先全扫）
+    let (files, bytes): (i64, i64) = db.with(|conn| {
+        let f: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM mtime_baseline WHERE version_id=?1",
+            params![version_id],
+            |r| r.get(0),
+        )?;
+        let b: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size_bytes),0) FROM mtime_baseline WHERE version_id=?1",
+            params![version_id],
+            |r| r.get(0),
+        )?;
+        Ok((f.max(1), b))
+    })?;
+    let concurrency = pick_concurrency(files);
+
+    let task_id = db.with(|conn| {
+        conn.execute(
+            "INSERT INTO transfer_tasks(repository_id, game_id, version_id, repo_no, source_rel,
+                dest_rel, total_bytes, total_files, written_bytes, written_files, concurrency,
+                direction, stage, status, created_at, updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,0,?9,'writeback','detect','queued',?10,?10)",
+            params![
+                meta.repository_id,
+                meta.game_id,
+                version_id,
+                cache::repo_no(meta.repo_slot),
+                meta.version_rel,
+                dest_rel,
+                bytes,
+                files,
+                concurrency,
+                Db::now()
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    })?;
+    engine.notify();
+    Ok(task_id)
 }
 
 pub fn pause_task(engine: &TransferEngine, task_id: i64) -> AppResult<()> {
@@ -782,7 +1039,9 @@ pub fn resume_task(engine: &TransferEngine, task_id: i64) -> AppResult<()> {
             ));
         }
         conn.execute(
-            "UPDATE transfer_tasks SET status='queued', updated_at=?1 WHERE id=?2",
+            "UPDATE transfer_tasks SET status='queued', updated_at=?1,
+                stage = CASE WHEN direction='writeback' THEN 'detect' ELSE stage END
+             WHERE id=?2",
             params![Db::now(), task_id],
         )?;
         Ok(())
@@ -814,7 +1073,7 @@ pub fn cancel_task(engine: &TransferEngine, task_id: i64) -> AppResult<()> {
     Ok(())
 }
 
-/// 重试 = 重建任务（已存在文件由 worker 跳过）
+/// 重试 = 重建任务（已存在文件由 worker 跳过）；回写任务则重建检测任务
 pub fn retry_task(engine: &TransferEngine, task_id: i64) -> AppResult<i64> {
     let db = &engine.db;
     let task = load_task(db, task_id)?.ok_or(AppError::TransferNotFound(task_id))?;
@@ -825,8 +1084,10 @@ pub fn retry_task(engine: &TransferEngine, task_id: i64) -> AppResult<i64> {
         )?;
         Ok(())
     })?;
-    let root = resolve_repo_root(db, task.repository_id)?;
-    start_transfer(engine, &root, task.version_id)
+    if task.direction.as_str() == "writeback" {
+        return start_writeback(engine, task.version_id);
+    }
+    start_transfer(engine, task.version_id)
 }
 
 /// 崩溃恢复：running → paused（启动时调用）

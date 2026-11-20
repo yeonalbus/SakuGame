@@ -236,11 +236,11 @@ pub fn load_version_meta(db: &Db, version_id: i64) -> AppResult<VersionMeta> {
     })
 }
 
-/// 预检：纯读，不预留。`repository_root` 为仓库根绝对路径。
+/// 预检：纯读，不预留。`version_root` 为版本层根绝对路径（v2.1：由锚点定位得出）。
 pub fn preflight(
     db: &Db,
     version_id: i64,
-    repository_root: &Path,
+    version_root: &Path,
 ) -> AppResult<TransferPreflight> {
     let cfg = load_config(db)?;
     let meta = load_version_meta(db, version_id)?;
@@ -259,7 +259,7 @@ pub fn preflight(
     } else if is_cached(db, version_id)? {
         reason = Some(PreflightReason::AlreadyCached);
     } else {
-        let src = join_rel(repository_root, &meta.version_rel);
+        let src = version_root.to_path_buf();
         required = sum_tree(&src)?.0;
         if required > quota_room {
             reason = Some(PreflightReason::QuotaExceeded);
@@ -443,7 +443,7 @@ pub fn has_active_task(db: &Db, version_id: i64) -> AppResult<bool> {
     db.with(|conn| {
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM transfer_tasks
-             WHERE version_id=?1 AND status IN ('queued','running','paused')",
+             WHERE version_id=?1 AND status IN ('queued','running','paused','waiting_confirm')",
             params![version_id],
             |r| r.get(0),
         )?;
