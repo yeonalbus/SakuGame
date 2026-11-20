@@ -1,7 +1,7 @@
-# SakuGame 项目结构（PROJECT_TREE）
+﻿# SakuGame 项目结构（PROJECT_TREE）
 
 > 维护者：AI（`DSPlans/` 体系）。目录结构或文件职责发生变化时同步更新本文件（发布流程 §5）。
-> 最近更新：2026-11-02（v1.1：两层结构 + 版本管理）
+> 最近更新：2026-11-20（v2.1：变更组 / 锚点 / 回写）
 
 ## 一、根目录
 
@@ -38,13 +38,14 @@ SakuGame/
 | `App.vue` | 根组件：页面切换（主页 / 搬运 / 详情 / 设置）、全局 toast |
 | `api.ts` | Tauri IPC 封装：仓库、档案、版本、可执行文件、黑名单、扫描、缓存池、搬运、启动命令 + 事件（`scan://*` / `transfer://*` / `cache://usage`） |
 | `types.ts` | 与 Rust `models.rs` 对应的 TS 类型（snake_case 字段，与 serde 输出一致） |
-| `styles.css` | 全局样式（含 v2 进度条、容量环、任务卡片） |
+| `styles.css` | 全局样式（含 v2 进度条、容量环、任务卡片；v2.1 并发池条 / 微步骤流水线 / 勾选弹窗 / 形态胶囊） |
 | `vite-env.d.ts` | Vite 类型声明 |
 | `components/Sidebar.vue` | 左侧导航（主页 / 搬运 / 设置） |
 | `components/GameCard.vue` | 游戏卡片：封面、编号角标、缺失标记、版本数角标、长标题自适应缩字号 |
+| `components/WritebackDialog.vue` | v2.1 变更组勾选弹窗：按「游戏本体 / 用户路径」分组的树形勾选、`required` 文件锁定、删除项展示、确认回写 / 中止 |
 | `views/HomeView.vue` | 主页卡片墙：列出档案（1 游戏 1 卡），监听扫描完成事件刷新 |
-| `views/GameDetailView.vue` | 详情页：版本管理（版本名 / 备注 / 启动项）、按钮态机（搬运 / 排队 / 进度 / 暂停 / 取消 / 恢复 / 重试 / 启动 / 配置启动项 / 压缩包未就绪）、从缓存池移除、单档案重扫、删除档案与版本、名称 / 编号内联编辑、封面更换 |
-| `views/TransferView.vue` | 搬运页：按状态分组（搬运中 / 排队中 / 暂停中 / 出错 / 完成），进度 / 速率 / ETA，暂停 / 恢复 / 取消 / 重试 |
+| `views/GameDetailView.vue` | 详情页：版本管理（版本名 / 备注 / 启动项 / 用户路径）、形态胶囊、变更组摘要、按钮态机（搬运 / 排队 / 进度 / 暂停 / 取消 / 恢复 / 重试 / 回写中 / 待确认 / 启动 / 配置启动项 / 压缩包未就绪）、移出缓存（先检测再勾选回写）、单档案重扫、删除档案与版本、名称 / 编号内联编辑、封面更换 |
+| `views/TransferView.vue` | 搬运页：按状态分组（搬运中含待确认 / 排队中 / 暂停中 / 出错 / 完成），方向徽章、四步流水线、全局并发池条、进度 / 速率 / ETA，暂停 / 恢复 / 取消 / 重试 / 勾选回写 |
 | `views/SettingsView.vue` | 设置页：缓存池（路径 / 容量 / 单位 / 环形容量图 / 路径锁定）、仓库管理（盘符 / IP / 主机名三定位）、扫描控制、扫描告警明细、黑名单、关于 |
 | `assets/vue.svg` | Vite 模板图标（可清理） |
 
@@ -62,13 +63,15 @@ SakuGame/
 | `src/commands.rs` | Tauri 命令层：仓库 CRUD（含删除预览）、档案 / 版本读写、可执行文件配置、黑名单、扫描控制、缓存池配置、预检、搬运控制、从缓存池移除、启动、版本运行时状态 |
 | `src/scanner.rs` | 扫描器：两层枚举（游戏标识层 → 版本标识层）、版本大小递归统计（含子目录）、压缩白名单与分卷聚合、排除名单、根级目录排除、可见性告警 |
 | `src/store.rs` | 两层结构幂等落库：游戏 + 版本 + 可执行文件，重扫保护矩阵，黑名单跳过 |
-| `src/db.rs` | SQLite 持久化层（WAL、外键、schema v4：v1.1 八表 + `transfer_tasks` / `cache_entries` + `repositories.cache_slot` 槽位号；检测到 v1 旧库则清空业务表重建） |
+| `src/db.rs` | SQLite 持久化层（WAL、外键、schema v5：v2 各表 + `games.game_uuid`、`game_versions.{version_uuid,last_known_path,anchor_hash,user_path}`、`alter_files` / `mtime_baseline` / `writeback_packages`；v1 旧库清空重建、v4 任务表重建并保留历史行） |
 | `src/cache.rs` | 缓存池：配置读写与校验（路径不得在仓库根内、有缓存时锁路径）、槽位号分配（最小可用号）、容量记账（已用 / 预留 / 安全线）、预检、池内路径约定（`R{槽位}`）、对账（`missing` 标记）、从缓存池移除 |
-| `src/transfer.rs` | 搬运机：任务创建与预留、调度线程（全局 32 通道 + 按文件数定档 4/8/16/32）、staging 复制与进度、L1 校验、原子 rename、暂停 / 恢复 / 取消、失败重试、崩溃恢复 |
-| `src/models.rs` | 数据模型：两层结构 DTO（`GameRow` / `GameVersionRow` / `ExecutableRow` / `BlocklistRow`）+ 扫描器内部结构 + v2 缓存池 / 搬运 DTO |
+| `src/transfer.rs` | 搬运机：任务创建与预留、调度线程（全局 32 通道 + 按文件数定档 4/8/16/32，v2.1 回写优先 + 可抢占搬运）、staging 复制与进度、L1 校验、原子 rename、注入与基线阶段、暂停 / 恢复 / 取消、失败重试、崩溃恢复、回写任务执行 |
+| `src/anchor.rs` | v2.1 锚点：`.SakuAnchor.json` 读写与原子写、锚点校验 / 重建、扫描后整仓同步、版本层根定位（`last_known_path` → 全库锚点兜底 → 仓库定位项） |
+| `src/alter.rs` | v2.1 变更组：注入（BG/UD 覆盖 + 指纹）、mtime 基线、检测（hash 严格 + mtime 宽松取并集）、`.waiting` 回写包（提取 / 清理 / 回写 / 崩溃恢复）、摘要 |
+| `src/models.rs` | 数据模型：两层结构 DTO（`GameRow` / `GameVersionRow` / `ExecutableRow` / `BlocklistRow`）+ 扫描器内部结构 + v2 缓存池 / 搬运 DTO + v2.1 锚点 / 变更组 / 回写 DTO |
 | `src/locator.rs` | 仓库定位：盘符 → IP → 主机名可达性探测 |
 | `src/state.rs` | 全局状态：数据库句柄、扫描槽、搬运机引擎 |
-| `src/error.rs` | 统一错误类型 `AppError`（含 v2 缓存池 / 搬运 / 启动变体，Tauri 命令统一返回 `Result<T, AppError>`） |
+| `src/error.rs` | 统一错误类型 `AppError`（含 v2 缓存池 / 搬运 / 启动、v2.1 回写 / 用户路径 / 锚点变体，Tauri 命令统一返回 `Result<T, AppError>`） |
 | `tests/real_repo_scan.rs` | 真实仓库扫描验收测试（默认 `#[ignore]`，手动触发） |
 | `gen/schemas/` | Tauri 生成的权限 schema（不入库） |
 | `target/` | Cargo 构建产物（不入库） |
@@ -88,7 +91,10 @@ SakuGame/
 | 缓存池配置（路径 / 容量 / 单位 / 容量图） | `SettingsView.vue` | `commands.rs`（`get_cache_config` / `set_cache_config`）、`cache.rs` |
 | 容量预检与记账 | `GameDetailView.vue` | `commands.rs`（`preflight_transfer` / `get_cache_usage`）、`cache.rs` |
 | 搬运（排队 / 暂停 / 恢复 / 取消 / 重试） | `GameDetailView.vue`、`TransferView.vue` | `transfer.rs`、`commands.rs`、事件 `transfer://progress` / `transfer://state` |
-| 从缓存池移除 | `GameDetailView.vue` | `commands.rs`（`remove_cache`）、`cache.rs` |
+| 移出缓存（检测 + 勾选回写） | `GameDetailView.vue`、`TransferView.vue`、`WritebackDialog.vue` | `commands.rs`（`start_writeback` / `get_writeback_plan` / `confirm_writeback` / `abort_writeback`）、`alter.rs`、`transfer.rs` |
+| 变更组注入与 mtime 基线 | —（搬运阶段自动） | `alter.rs`、`transfer.rs`、事件 `transfer://state` |
+| 用户路径配置 | `GameDetailView.vue` | `commands.rs`（`set_version_user_path`）、`anchor.rs` |
+| 锚点与移动后重定位 | —（搬运时自动） | `anchor.rs`、`commands.rs`（`preflight_transfer` / `start_transfer`） |
 | 启动游戏 | `GameDetailView.vue` | `commands.rs`（`launch_game`）：池内路径映射，不依赖仓库可达 |
 | 仓库删除（连带清理池内文件） | `SettingsView.vue` | `commands.rs`（`get_repository_delete_preview` / `delete_repository`）、`cache.rs` |
 | 应用配置（窗口 / 权限 / 图标 / 打包） | — | `tauri.conf.json`、`capabilities/`、`icons/` |
@@ -99,17 +105,20 @@ SakuGame/
 
 设置页配置缓存池 → 详情页点「搬运」→ `preflight_transfer`（池配置 / 配额 / 安全线 / 压缩包 / 已缓存）→ `start_transfer` 递归求和 + 预留 + 入队 → 调度线程按 32 通道与文件数档位调入 → 工作线程池写入 `.staging/<task_id>/` → L1 校验 → 原子 rename 到 `池根/R{仓库id}/游戏标识层[/SakuVersion]` → 写 `cache_entries` → 事件 `transfer://progress`（200ms 节流）/ `transfer://state` → 详情页与搬运页同步；「启动」从池内路径拉起，全程不探测仓库；「从缓存池移除」删副本并归还容量。
 
-## 六、数据模型（v2）
+## 六、数据模型（v2.1）
 
 | 表 | 含义 |
 | --- | --- |
-| `games` | 游戏档案（= 仓库根的直接子目录），含形态、名称、编号、封面、当前选中版本 |
-| `game_versions` | 版本（= 游戏目录的直接子目录；紧凑型为游戏目录自身），含目录原名、显示名、备注、来源（scan / manual）、状态 |
+| `games` | 游戏档案（= 仓库根的直接子目录），含形态、名称、编号、封面、当前选中版本、`game_uuid` 锚点身份 |
+| `game_versions` | 版本（= 游戏目录的直接子目录；紧凑型为游戏目录自身），含目录原名、显示名、备注、来源（scan / manual）、状态、`version_uuid` / `last_known_path` / `anchor_hash` / `user_path` |
 | `game_version_executables` | 版本内的候选 / 手填可执行文件，`is_selected` 为启动项，`invalid` 表示重扫后已找不到 |
 | `game_version_files` | 版本内的压缩包文件（分卷按 `group_key` 聚合）；v2 不支持压缩包搬运，仅保留识别信息 |
 | `blocklist` | 删除的档案与版本（`kind` = game / version），重扫时跳过 |
-| `transfer_tasks` | 搬运任务（进行中与历史）：仓库编号快照、源 / 池内相对路径、总量、已写、档位、状态、失败清单 |
+| `transfer_tasks` | 搬运 / 回写任务（进行中与历史）：仓库编号快照、源 / 池内相对路径、总量、已写、档位、`direction`、`stage`、状态、失败清单 |
 | `cache_entries` | 缓存记录（每版本一条）：池内相对路径、体积、文件数、`ok` / `missing`（对账标记） |
+| `alter_files` | v2.1 变更组文件：`scope`（bg / ud）、相对路径、大小、blake3 指纹（回写后更新） |
+| `mtime_baseline` | v2.1 mtime 基线：`scope`、相对路径、大小、mtime（毫秒），注入后整体覆盖写 |
+| `writeback_packages` | v2.1 回写包：检测候选 / 确认清单（JSON）、阶段、与 `.waiting/<task_id>/` 对应 |
 
 ## 七、维护提示
 
