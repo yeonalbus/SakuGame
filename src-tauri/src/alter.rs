@@ -1,7 +1,7 @@
 //! 变更组：注入 / 检测 / 存储（含 `.waiting` 回写包与崩溃恢复）。
 //! 依据：DSPlans/Specs/MVPv2.1技术规格.md §6 / §7 / §8
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, OptionalExtension};
@@ -22,9 +22,7 @@ pub const WAITING_DIR: &str = ".waiting";
 pub const MANIFEST_FILE: &str = "manifest.json";
 const MANIFEST_SCHEMA: i64 = 1;
 
-/// 未入库文件的逐项列出上限：超过则只列「自基线变动过」的，避免弹窗被整包文件压垮
-const BG_FULL_LIMIT_FILES: usize = 5000;
-const BG_FULL_LIMIT_BYTES: i64 = 1 << 30; // 1 GiB
+/// 用户路径未入库文件的逐项列出上限：超过则只列「自基线变动过」的，避免弹窗被整包文件压垮
 const UD_FULL_LIMIT_FILES: usize = 5000;
 const UD_FULL_LIMIT_BYTES: i64 = 512 << 20; // 512 MiB
 
@@ -371,36 +369,31 @@ pub fn detect(db: &Db, version_id: i64) -> AppResult<WritebackCandidates> {
         }
     }
 
-    // 2) 游戏本体：未入库的当前文件（B 口径：变更组里没有的一律待入库，由用户判别）
-    let bg_missing: Vec<&ScannedFile> = bg_now
-        .iter()
-        .filter(|f| !alter_map.contains_key(&("bg".to_string(), f.rel_path.clone())))
-        .collect();
-    let bg_missing_bytes: i64 = bg_missing.iter().map(|f| f.size_bytes).sum();
-    let bg_overflow =
-        bg_missing.len() > BG_FULL_LIMIT_FILES || bg_missing_bytes > BG_FULL_LIMIT_BYTES;
-    for f in &bg_missing {
-        let changed = mtime_changed(f, &baseline, "bg");
-        if bg_overflow && !changed {
-            continue; // 超过逐项上限时只列变动过的
-        }
-        let entry = map
-            .entry(("bg".to_string(), f.rel_path.clone()))
-            .or_insert_with(|| candidate_from(f, "bg", &f.rel_path));
-        push_reason(entry, "new");
-        if changed {
-            push_reason(entry, "mtime");
-        }
-    }
-    if bg_overflow {
-        hidden.push(format!(
-            "游戏本体有 {} 个未入库文件（{}），超过逐项列出上限，已只显示自基线变动过的；如需完整备份请单独处理该版本",
-            bg_missing.len(),
-            human_bytes(bg_missing_bytes)
-        ));
-    }
-    // 基线里已删除、且不在变更组的 BG 文件
+    // 2) 游戏本体：mtime 基线门槛。本体一定存在于 HDD，未变的文件不回写也不必列出。
+    //    已入库文件已在 1) 用 hash 判定，这里只看「未入库」的当前文件。
     if bg_baseline_ready {
+        let bg_alter: HashSet<&str> = alter_rows
+            .iter()
+            .filter(|r| r.scope == "bg")
+            .map(|r| r.rel_path.as_str())
+            .collect();
+        for f in &bg_now {
+            if bg_alter.contains(f.rel_path.as_str()) {
+                continue;
+            }
+            let key = ("bg".to_string(), f.rel_path.clone());
+            let listed = match baseline.get(&key) {
+                None => true, // 基线里没有 → 新增
+                Some((b_size, b_mtime)) => f.size_bytes != *b_size || f.mtime_ms != *b_mtime,
+            };
+            if listed {
+                let entry = map
+                    .entry(key)
+                    .or_insert_with(|| candidate_from(f, "bg", &f.rel_path));
+                push_reason(entry, "mtime");
+            }
+        }
+        // 基线里已删除、且不在变更组的 BG 文件
         for (scope, rel) in baseline.keys() {
             if scope != "bg" || alter_map.contains_key(&(scope.clone(), rel.clone())) {
                 continue;
@@ -410,20 +403,28 @@ pub fn detect(db: &Db, version_id: i64) -> AppResult<WritebackCandidates> {
             }
         }
     }
+    // 无 bg 基线（旧缓存）→ 不列 BG，前端按 baseline_ready=false 给警告
 
-    // 3) 用户路径：未入库的当前文件（路径可用即全量待入库）
+    // 3) 用户路径：按「是否入库」判断。UD 不一定在 HDD 的版本目录里，
+    //    因此 SakuAlter/UD 中还没有的文件一律列出（与 mtime 是否变化无关）。
     if up_state == "ok" {
+        let ud_alter: HashSet<&str> = alter_rows
+            .iter()
+            .filter(|r| r.scope == "ud")
+            .map(|r| r.rel_path.as_str())
+            .collect();
         let ud_missing: Vec<&ScannedFile> = ud_now
             .iter()
-            .filter(|f| !alter_map.contains_key(&("ud".to_string(), f.rel_path.clone())))
+            .filter(|f| !ud_alter.contains(f.rel_path.as_str()))
             .collect();
         let ud_missing_bytes: i64 = ud_missing.iter().map(|f| f.size_bytes).sum();
         let ud_overflow =
             ud_missing.len() > UD_FULL_LIMIT_FILES || ud_missing_bytes > UD_FULL_LIMIT_BYTES;
+
         for f in &ud_missing {
             let changed = mtime_changed(f, &baseline, "ud");
             if ud_overflow && !changed {
-                continue;
+                continue; // 超量保护：只列自基线变动过的
             }
             let entry = map
                 .entry(("ud".to_string(), f.rel_path.clone()))
@@ -1245,7 +1246,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// T21-26：旧缓存（无任何基线）+ 刚配置用户路径 → 用户目录全量进候选，游戏本体不出候选
+    /// T21-26：旧缓存（无 bg 基线）+ 刚配置用户路径 → 用户目录全量进候选，游戏本体不出候选
     #[test]
     fn detect_ud_full_without_baseline() {
         let (db, base) = seed_db("udnobase");
@@ -1277,37 +1278,79 @@ mod tests {
             .collect();
         assert!(uds.contains(&"Player.log"), "用户目录文件应全量进候选: {uds:?}");
         assert!(uds.contains(&"file/prev.log"), "子目录文件也应进候选: {uds:?}");
-        // B 口径：游戏本体未入库文件同样进候选，但标记为「未入库」而非「变动」
-        let bg: Vec<&CandidateFile> = c.files.iter().filter(|f| f.scope == "bg").collect();
-        assert_eq!(bg.len(), 1, "本体唯一的 a.dat 应作为未入库文件列出");
-        assert!(bg[0].reason.iter().any(|r| r == "new"), "{:?}", bg[0].reason);
-        assert!(!bg[0].required, "未入库文件不应强制回写");
+        assert!(
+            c.files.iter().all(|f| f.scope != "bg"),
+            "无 bg 基线时游戏本体一律不列（HDD 本体还在）"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// T21-28：变更组为空且文件自基线未变 → 仍作为「未入库」进候选（B 口径）
+    /// T21-28：BG 未入库但自基线未变 → 不列；UD 未入库未变 → 照样列出
     #[test]
-    fn detect_lists_unaltered_unregistered_files() {
-        let (db, base) = seed_db("unaltered");
+    fn detect_bg_uses_baseline_ud_uses_registry() {
+        let (db, base) = seed_db("bgud");
         let vroot = base.join("pool").join("R01").join("G").join("Ver");
         std::fs::create_dir_all(&vroot).unwrap();
         std::fs::write(vroot.join("a.dat"), b"AAA").unwrap();
-        record_baseline(&db, 1, &vroot, None).unwrap();
+
+        let up = base.join("user");
+        std::fs::create_dir_all(&up).unwrap();
+        std::fs::write(up.join("save.dat"), b"SAVE").unwrap();
+        db.with(|c| {
+            c.execute(
+                "UPDATE game_versions SET user_path=?1 WHERE id=1",
+                params![up.to_string_lossy().to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // 记录基线（BG + UD），此后什么都不改
+        record_baseline(&db, 1, &vroot, Some(up.to_string_lossy().as_ref())).unwrap();
 
         let c = detect(&db, 1).unwrap();
-        let a = c
+        assert!(
+            !c.files.iter().any(|f| f.scope == "bg"),
+            "BG 未入库且未变动 → 不得列出（本体一定在 HDD）: {:?}",
+            c.files.iter().map(|f| (&f.scope, &f.rel_path)).collect::<Vec<_>>()
+        );
+        let ud = c
             .files
             .iter()
-            .find(|f| f.rel_path == "a.dat")
-            .expect("未入库且未变的文件也必须列出（B 口径）");
-        assert!(a.reason.iter().any(|r| r == "new"), "{:?}", a.reason);
-        assert!(
-            !a.reason.iter().any(|r| r == "mtime"),
-            "未变动就不该标 mtime：{:?}",
-            a.reason
-        );
-        assert!(!a.required);
+            .find(|f| f.scope == "ud" && f.rel_path == "save.dat")
+            .expect("UD 未入库 → 必须列出（SakuAlter/UD 里没有副本）");
+        assert!(ud.reason.iter().any(|r| r == "new"), "{:?}", ud.reason);
+        assert!(!ud.required, "未入库文件由用户判别，不强制");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// T21-22：已入库且内容变更 → required（不列出、确认时自动回写）
+    #[test]
+    fn detect_required_for_changed_registered_file() {
+        let (db, base) = seed_db("required");
+        let vroot = base.join("pool").join("R01").join("G").join("Ver");
+        std::fs::create_dir_all(vroot.join(ALTER_DIR).join(BG_DIR)).unwrap();
+        std::fs::write(vroot.join("a.dat"), b"A").unwrap();
+        std::fs::write(vroot.join(ALTER_DIR).join(BG_DIR).join("save.dat"), b"S1").unwrap();
+        inject(&db, 1, &vroot, None).unwrap();
+        record_baseline(&db, 1, &vroot, None).unwrap();
+
+        // 游戏改写已入库的存档
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        std::fs::write(vroot.join("save.dat"), b"S2").unwrap();
+
+        let c = detect(&db, 1).unwrap();
+        let save = c
+            .files
+            .iter()
+            .find(|f| f.rel_path == "save.dat")
+            .expect("已入库且内容变更的文件应返回（前端不列出，回写自动带上）");
+        assert!(save.required, "已入库内容变更必须 required");
+        assert!(save.reason.iter().any(|r| r == "hash"), "{:?}", save.reason);
+        // 未改动的 a.dat 属于本体未入库未变动 → 不列
+        assert!(!c.files.iter().any(|f| f.rel_path == "a.dat"));
 
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -28,14 +28,10 @@ async function load() {
     plan.value = p;
     const next: Record<string, boolean> = {};
     for (const f of p.files) {
-      // 默认勾选：required（已入库且内容变更）必选；用户路径全量默认勾；
-      // 游戏本体里「未入库且自基线未变」的默认不勾（避免一确认就把整包塞进 SakuAlter）
-      const unalteredBg =
-        f.scope === "bg" &&
-        !f.required &&
-        f.reason.includes("new") &&
-        !f.reason.includes("mtime");
-      next[keyOf(f.scope, f.rel_path)] = !unalteredBg;
+      // 已入库且内容变更（required）不进勾选列表，确认时后端自动带上；
+      // 其余是需要用户判别的未入库文件，默认全选（可取消）
+      if (f.required) continue;
+      next[keyOf(f.scope, f.rel_path)] = true;
     }
     checked.value = next;
   } catch (e) {
@@ -55,6 +51,9 @@ watch(
   { immediate: true },
 );
 
+/** 需要用户判别的候选：已入库且内容变更（required）不列出，回写时自动带上 */
+const displayFiles = computed(() => (plan.value?.files ?? []).filter((f) => !f.required));
+
 interface DirGroup {
   dir: string;
   files: CandidateFile[];
@@ -62,7 +61,7 @@ interface DirGroup {
 
 function groupsOf(scope: "bg" | "ud"): DirGroup[] {
   const map = new Map<string, CandidateFile[]>();
-  for (const f of plan.value?.files ?? []) {
+  for (const f of displayFiles.value) {
     if (f.scope !== scope) continue;
     const idx = f.rel_path.lastIndexOf("/");
     const dir = idx < 0 ? "." : f.rel_path.slice(0, idx);
@@ -76,7 +75,7 @@ function groupsOf(scope: "bg" | "ud"): DirGroup[] {
 
 const bgGroups = computed(() => groupsOf("bg"));
 const udGroups = computed(() => groupsOf("ud"));
-const hasFiles = computed(() => (plan.value?.files.length ?? 0) > 0);
+const hasFiles = computed(() => displayFiles.value.length > 0);
 const requiredCount = computed(
   () => plan.value?.files.filter((f) => f.required).length ?? 0,
 );
@@ -111,22 +110,18 @@ function toggleDir(g: DirGroup) {
 }
 
 function scopeState(scope: "bg" | "ud") {
-  const list = (plan.value?.files ?? []).filter(
-    (f) => f.scope === scope && !f.required,
-  );
-  const total = (plan.value?.files ?? []).filter((f) => f.scope === scope).length;
-  if (total === 0) return { all: false, none: true, locked: true };
-  if (list.length === 0) return { all: true, none: false, locked: true };
-  const on = list.filter((f) => checked.value[keyOf(f.scope, f.rel_path)] !== false).length;
-  return { all: on === list.length, none: on === 0, locked: false };
+  const all = displayFiles.value.filter((f) => f.scope === scope);
+  if (all.length === 0) return { all: false, none: true, locked: true };
+  const on = all.filter((f) => checked.value[keyOf(f.scope, f.rel_path)] !== false).length;
+  return { all: on === all.length, none: on === 0, locked: false };
 }
 
 function toggleScope(scope: "bg" | "ud") {
   const st = scopeState(scope);
   const target = st.locked ? true : !st.all;
   const next = { ...checked.value };
-  for (const f of plan.value?.files ?? []) {
-    if (f.scope !== scope || f.required) continue;
+  for (const f of displayFiles.value) {
+    if (f.scope !== scope) continue;
     next[keyOf(f.scope, f.rel_path)] = target;
   }
   checked.value = next;
@@ -200,9 +195,13 @@ async function cancel() {
             </span>
           </h3>
           <p class="wb-hint">
-            <template v-if="hasFiles">
-              标记「自动回写」的为已入库且内容变更，必须回写；其余请勾选需要存入 SakuAlter 的文件。
+            <template v-if="requiredCount > 0 && hasFiles">
+              {{ requiredCount }} 个已入库文件内容已变更，将自动回写；请勾选需要额外存入 SakuAlter 的文件。
             </template>
+            <template v-else-if="requiredCount > 0">
+              {{ requiredCount }} 个已入库文件内容已变更，确认后将直接回写。
+            </template>
+            <template v-else-if="hasFiles">请勾选需要存入 SakuAlter 的文件。</template>
             <template v-else>没有检测到需要回写的文件，确认后将直接移除缓存副本。</template>
           </p>
         </div>
@@ -225,7 +224,7 @@ async function cancel() {
             建议先取消并重新搬运一次（搬运会建立基线）。用户路径若已配置，本次仍会列出其全部文件。
           </div>
           <div v-if="requiredCount > 0" class="wb-note">
-            已入库且内容变更的文件 {{ requiredCount }} 个，将自动回写且不可取消勾选
+            {{ requiredCount }} 个已入库文件内容已变更，将自动回写（不在此列出）
           </div>
           <div v-if="plan.hidden_note" class="wb-note">{{ plan.hidden_note }}</div>
 
