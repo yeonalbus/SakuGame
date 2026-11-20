@@ -22,6 +22,12 @@ pub const WAITING_DIR: &str = ".waiting";
 pub const MANIFEST_FILE: &str = "manifest.json";
 const MANIFEST_SCHEMA: i64 = 1;
 
+/// 未入库文件的逐项列出上限：超过则只列「自基线变动过」的，避免弹窗被整包文件压垮
+const BG_FULL_LIMIT_FILES: usize = 5000;
+const BG_FULL_LIMIT_BYTES: i64 = 1 << 30; // 1 GiB
+const UD_FULL_LIMIT_FILES: usize = 5000;
+const UD_FULL_LIMIT_BYTES: i64 = 512 << 20; // 512 MiB
+
 // ---------------------------------------------------------------------------
 // 通用工具
 // ---------------------------------------------------------------------------
@@ -329,9 +335,17 @@ pub fn detect(db: &Db, version_id: i64) -> AppResult<WritebackCandidates> {
 
     let mut map: HashMap<(String, String), CandidateFile> = HashMap::new();
     let mut deleted: Vec<String> = Vec::new();
+    let mut hidden: Vec<String> = Vec::new();
 
-    // 1) hash 严格口径：变更组文件（用户路径不可达时跳过 UD，避免全量误报为删除）
+    // 变更组指纹索引（决定「已入库 / 未入库」）
+    let alter_map: HashMap<(String, String), String> = alter_rows
+        .iter()
+        .map(|r| ((r.scope.clone(), r.rel_path.clone()), r.hash.clone()))
+        .collect();
+
+    // 1) 已入库文件：hash 严格口径（内容变了 → required，必须回写）
     for row in &alter_rows {
+        // 用户路径不可达时跳过 UD，避免全量误报为删除
         if row.scope == "ud" && up_state != "ok" {
             continue;
         }
@@ -349,9 +363,7 @@ pub fn detect(db: &Db, version_id: i64) -> AppResult<WritebackCandidates> {
                     let entry = map
                         .entry((row.scope.clone(), row.rel_path.clone()))
                         .or_insert_with(|| candidate_from(f, &row.scope, &row.rel_path));
-                    if !entry.reason.iter().any(|r| r == "hash") {
-                        entry.reason.push("hash".into());
-                    }
+                    push_reason(entry, "hash");
                     entry.required = true;
                 }
             }
@@ -359,60 +371,79 @@ pub fn detect(db: &Db, version_id: i64) -> AppResult<WritebackCandidates> {
         }
     }
 
-    // 2) mtime 宽松口径：BG（无 bg 基线时整段跳过，避免把整个游戏判成变动）
+    // 2) 游戏本体：未入库的当前文件（B 口径：变更组里没有的一律待入库，由用户判别）
+    let bg_missing: Vec<&ScannedFile> = bg_now
+        .iter()
+        .filter(|f| !alter_map.contains_key(&("bg".to_string(), f.rel_path.clone())))
+        .collect();
+    let bg_missing_bytes: i64 = bg_missing.iter().map(|f| f.size_bytes).sum();
+    let bg_overflow =
+        bg_missing.len() > BG_FULL_LIMIT_FILES || bg_missing_bytes > BG_FULL_LIMIT_BYTES;
+    for f in &bg_missing {
+        let changed = mtime_changed(f, &baseline, "bg");
+        if bg_overflow && !changed {
+            continue; // 超过逐项上限时只列变动过的
+        }
+        let entry = map
+            .entry(("bg".to_string(), f.rel_path.clone()))
+            .or_insert_with(|| candidate_from(f, "bg", &f.rel_path));
+        push_reason(entry, "new");
+        if changed {
+            push_reason(entry, "mtime");
+        }
+    }
+    if bg_overflow {
+        hidden.push(format!(
+            "游戏本体有 {} 个未入库文件（{}），超过逐项列出上限，已只显示自基线变动过的；如需完整备份请单独处理该版本",
+            bg_missing.len(),
+            human_bytes(bg_missing_bytes)
+        ));
+    }
+    // 基线里已删除、且不在变更组的 BG 文件
     if bg_baseline_ready {
-        for ((scope, rel), (b_size, b_mtime)) in &baseline {
-            if scope != "bg" {
+        for (scope, rel) in baseline.keys() {
+            if scope != "bg" || alter_map.contains_key(&(scope.clone(), rel.clone())) {
                 continue;
             }
-            match find_file(&bg_now, &ud_now, scope, rel) {
-                Some(f) => {
-                    if f.size_bytes != *b_size || f.mtime_ms != *b_mtime {
-                        let entry = map
-                            .entry((scope.clone(), rel.clone()))
-                            .or_insert_with(|| candidate_from(f, scope, rel));
-                        if !entry.reason.iter().any(|r| r == "mtime") {
-                            entry.reason.push("mtime".into());
-                        }
-                    }
-                }
-                None => deleted.push(format!("{scope}:{rel}")),
-            }
-        }
-        // 基线里没有的当前 BG 文件 → 新增
-        for f in &bg_now {
-            if !baseline.contains_key(&("bg".to_string(), f.rel_path.clone())) {
-                let entry = map
-                    .entry(("bg".to_string(), f.rel_path.clone()))
-                    .or_insert_with(|| candidate_from(f, "bg", &f.rel_path));
-                if !entry.reason.iter().any(|r| r == "mtime") {
-                    entry.reason.push("mtime".into());
-                }
+            if find_file(&bg_now, &ud_now, scope, rel).is_none() {
+                deleted.push(format!("{scope}:{rel}"));
             }
         }
     }
 
-    // 3) mtime 宽松口径：UD（路径可用即比对；无 ud 基线 → 当前文件全量新增，对齐方案例子）
+    // 3) 用户路径：未入库的当前文件（路径可用即全量待入库）
     if up_state == "ok" {
-        for f in &ud_now {
-            let key = ("ud".to_string(), f.rel_path.clone());
-            let changed = match baseline.get(&key) {
-                None => true,
-                Some((b_size, b_mtime)) => f.size_bytes != *b_size || f.mtime_ms != *b_mtime,
-            };
+        let ud_missing: Vec<&ScannedFile> = ud_now
+            .iter()
+            .filter(|f| !alter_map.contains_key(&("ud".to_string(), f.rel_path.clone())))
+            .collect();
+        let ud_missing_bytes: i64 = ud_missing.iter().map(|f| f.size_bytes).sum();
+        let ud_overflow =
+            ud_missing.len() > UD_FULL_LIMIT_FILES || ud_missing_bytes > UD_FULL_LIMIT_BYTES;
+        for f in &ud_missing {
+            let changed = mtime_changed(f, &baseline, "ud");
+            if ud_overflow && !changed {
+                continue;
+            }
+            let entry = map
+                .entry(("ud".to_string(), f.rel_path.clone()))
+                .or_insert_with(|| candidate_from(f, "ud", &f.rel_path));
+            push_reason(entry, "new");
             if changed {
-                let entry = map
-                    .entry(key)
-                    .or_insert_with(|| candidate_from(f, "ud", &f.rel_path));
-                if !entry.reason.iter().any(|r| r == "mtime") {
-                    entry.reason.push("mtime".into());
-                }
+                push_reason(entry, "mtime");
             }
         }
-        // 相对 ud 基线的删除项（仅在有基线时才有意义）
+        if ud_overflow {
+            hidden.push(format!(
+                "用户路径有 {} 个未入库文件（{}），超过逐项列出上限，已只显示自基线变动过的",
+                ud_missing.len(),
+                human_bytes(ud_missing_bytes)
+            ));
+        }
+        // 相对 ud 基线已删除、且不在变更组的文件
         if ud_baseline_ready {
             for (scope, rel) in baseline.keys() {
-                if scope != "ud" {
+                if scope != "ud" || alter_map.contains_key(&(scope.clone(), rel.clone())) {
                     continue;
                 }
                 if find_file(&bg_now, &ud_now, scope, rel).is_none() {
@@ -441,7 +472,41 @@ pub fn detect(db: &Db, version_id: i64) -> AppResult<WritebackCandidates> {
         user_path_state: up_state.to_string(),
         baseline_ready,
         alter_ready,
+        hidden_note: if hidden.is_empty() {
+            None
+        } else {
+            Some(hidden.join("；"))
+        },
     })
+}
+
+fn push_reason(entry: &mut CandidateFile, reason: &str) {
+    if !entry.reason.iter().any(|r| r == reason) {
+        entry.reason.push(reason.to_string());
+    }
+}
+
+/// 相对基线的变动（无基线记录视为新增 → true）
+fn mtime_changed(f: &ScannedFile, baseline: &BaselineMap, scope: &str) -> bool {
+    match baseline.get(&(scope.to_string(), f.rel_path.clone())) {
+        None => true,
+        Some((b_size, b_mtime)) => f.size_bytes != *b_size || f.mtime_ms != *b_mtime,
+    }
+}
+
+fn human_bytes(bytes: i64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
 }
 
 fn find_file<'a>(
@@ -1212,10 +1277,37 @@ mod tests {
             .collect();
         assert!(uds.contains(&"Player.log"), "用户目录文件应全量进候选: {uds:?}");
         assert!(uds.contains(&"file/prev.log"), "子目录文件也应进候选: {uds:?}");
+        // B 口径：游戏本体未入库文件同样进候选，但标记为「未入库」而非「变动」
+        let bg: Vec<&CandidateFile> = c.files.iter().filter(|f| f.scope == "bg").collect();
+        assert_eq!(bg.len(), 1, "本体唯一的 a.dat 应作为未入库文件列出");
+        assert!(bg[0].reason.iter().any(|r| r == "new"), "{:?}", bg[0].reason);
+        assert!(!bg[0].required, "未入库文件不应强制回写");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// T21-28：变更组为空且文件自基线未变 → 仍作为「未入库」进候选（B 口径）
+    #[test]
+    fn detect_lists_unaltered_unregistered_files() {
+        let (db, base) = seed_db("unaltered");
+        let vroot = base.join("pool").join("R01").join("G").join("Ver");
+        std::fs::create_dir_all(&vroot).unwrap();
+        std::fs::write(vroot.join("a.dat"), b"AAA").unwrap();
+        record_baseline(&db, 1, &vroot, None).unwrap();
+
+        let c = detect(&db, 1).unwrap();
+        let a = c
+            .files
+            .iter()
+            .find(|f| f.rel_path == "a.dat")
+            .expect("未入库且未变的文件也必须列出（B 口径）");
+        assert!(a.reason.iter().any(|r| r == "new"), "{:?}", a.reason);
         assert!(
-            c.files.iter().all(|f| f.scope != "bg"),
-            "无 BG 基线时不得把整个游戏本体判成变动"
+            !a.reason.iter().any(|r| r == "mtime"),
+            "未变动就不该标 mtime：{:?}",
+            a.reason
         );
+        assert!(!a.required);
 
         let _ = std::fs::remove_dir_all(&base);
     }

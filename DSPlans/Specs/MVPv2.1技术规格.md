@@ -287,33 +287,33 @@ SakuAlter 存在时：校验/生成/修复锚点（§5.1）
 
 触发：用户点「移出缓存」→ `start_writeback(version_id)` → 建 `direction='writeback'`、`stage='detect'` 的任务。
 
+**判据**：候选 = 「变更组里没有的当前文件」+「变更组里有但内容变了的文件」。基线不再决定文件是否进候选，只用来标注「自基线变动过」与「已删除」。
+
 ```
 1. 缓存池版本层根不存在 → error
-2. 生成候选（BG）
-   a. hash 严格：遍历 alter_files(scope=bg)，逐个算 blake3 → 与记录不符 → reason 含 hash
-   b. mtime 宽松（仅当存在 bg 基线）：遍历 <版本层根> 全文件（排除 SakuAlter），与基线比
-        基线无该 rel_path → 新增；size 或 mtime_ms 不同 → 修改 → reason 含 mtime
-        基线有、当前无 → deleted（不勾选）
-3. 生成候选（UD）
-   user_path 未配置 → user_path_state=unset，跳过整个 UD 段
-   不可达 → user_path_state=unreachable，跳过整个 UD 段（变更组记录保留，不误报删除）
-   否则遍历 user_path 全文件：
-        有 ud 基线 → 与基线比（新增 / 修改 / deleted）
-        无 ud 基线（含「从未配置过用户路径，刚补配」的首次场景）→ **全部文件按新增进候选**
-        —— 依据方案 §二（二）例子：「未配置→配置」此时必定 mtime/hash 全失配，本次提取用户目录全部文件
-4. 并集去重（同 scope+rel_path 合并 reason）
-5. 已有变更组文件命中 hash 失配 → required=true（默认必回写，UI 不可取消）
+2. 已入库文件（alter_files 有记录）
+   当前存在 → 算 blake3：
+        与记录不同 → 进候选，reason=hash，required=true（必须回写、UI 锁定不可取消）
+        与记录相同 → 不入候选（已同步）
+   当前不存在 → deleted
+3. 未入库文件（alter_files 无记录，遍历当前全部文件）
+   BG：<版本层根> 全文件，排除 SakuAlter
+   UD：user_path 可达时遍历全文件；unset / unreachable → 整段跳过（变更组记录保留，不误报删除）
+   每个未入库文件 → 进候选，reason=new
+        若相对基线为新增或 size/mtime 变化 → 追加 reason=mtime
+   超量保护：BG 超过 5000 个文件或 1 GiB、UD 超过 5000 个文件或 512 MiB 时，
+        只保留「自基线变动过」的未入库文件，并给出 hidden_note 说明省略了多少
+4. 删除项：基线有、当前无、且不在变更组 → deleted（仅展示，不可勾选）
+5. 并集去重（同 scope+rel_path 合并 reason）
 6. 候选结果落 writeback_packages（stage=detected），前端按 task_id 拉取
-7. hash 阶段算出的内容 hash 一并返回（前端确认后回写时免重算）
+7. 已入库文件在 hash 阶段算出的内容 hash 随确认结果一起使用（回写时免重算）
 ```
 
-返回 `WritebackCandidates`。前端渲染勾选树（按目录前缀分组）。
+返回 `WritebackCandidates`。前端渲染勾选树（按目录前缀分组：游戏本体 / 用户路径）。
 
-**基线口径（按 scope 分开）**：`bg_baseline_ready` / `ud_baseline_ready` 独立判断；`WritebackCandidates.baseline_ready` 对外表示 **BG 基线**是否就绪。
+**默认勾选规则**（前端）：`required` 一律勾选且锁定；`bg + 仅 new`（未入库且自基线未变）默认**不勾**，避免一次确认把整个游戏塞进 `SakuAlter`；其余（UD 全部未入库、BG 新增/变动、hash 变更）默认勾选。用户可自行增减。
 
-- BG 无基线（v2.1 之前的旧缓存）→ 不做 mtime 全量比对（否则整个游戏几十 GB 全被判变动），前端弹窗给强警告：「游戏本体内的变动无法检测，建议先取消并重新搬运一次（搬运会建立基线）」。
-- UD 无基线但路径可用 → 当前用户目录全量进候选（见 3）。
-- `alter_files` 为空 → `alter_ready=false`（hash 段自然跳过），不影响 mtime 段。
+**基线口径**：`bg_baseline_ready` / `ud_baseline_ready` 独立判断；`WritebackCandidates.baseline_ready` 对外表示 **BG 基线**是否就绪（缺失时弹窗给「建议重新搬运一次以建立基线」的警告）。基线只影响 reason 标注与删除项，不影响候选集合。
 
 **配置用户路径后的联动**：`set_version_user_path` 若发现该版本存在 `waiting_confirm` 或 `paused` 的 writeback 任务，**自动把任务重置为 `queued` / `stage=detect`** 并唤醒调度器重新检测；前端保存路径后关闭旧候选弹窗，等 `transfer://state` 携带新候选时自动重新弹出。
 
@@ -491,9 +491,10 @@ waiting_confirm ──任务页取消──> (删行)
 | T21-22 | 变更组文件被改写 | reason 含 hash，required=true，不可取消 |
 | T21-23 | 同一文件同时 hash + mtime 变 | 合并成一条，reason 两项 |
 | T21-24 | 删除文件 | 进 deleted 列表，不可勾选 |
-| T21-25 | 无基线旧缓存 | baseline_ready=false，提示，确认后直接清理 |
-| T21-26 | 旧缓存（无任何基线）+ 刚配置用户路径 | 用户目录全量文件进候选（默认全选），游戏本体不出候选 |
+| T21-25 | 无基线旧缓存 | baseline_ready=false；未入库文件仍全量列出；BG 未入库默认不勾、UD 默认勾 |
+| T21-26 | 变更组为空 + 目录文件自基线未变 | 全部作为「未入库」(reason=new) 进候选；BG 未入库默认不勾、UD 默认勾 |
 | T21-27 | 待确认任务期间配置/修改用户路径 | 任务自动重置为 queued/detect 重新检测，弹窗以新候选重新弹出 |
+| T21-28 | 未入库文件超量（BG > 5000 文件 / 1 GiB，UD > 5000 / 512 MiB） | 只列「自基线变动过」的未入库文件，`hidden_note` 说明省略数量 |
 | T21-30 | 确认回写 | .waiting 出现 → 池目录删除 → HDD SakuAlter 写入 → hash 更新 → 包清理 |
 | T21-31 | 弹窗取消 | 任务 paused，池内游戏与 SakuAlter 原样 |
 | T21-32 | 任务页取消 | 删任务行，池内游戏原样 |

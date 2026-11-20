@@ -271,6 +271,8 @@ export interface WritebackCandidates {
   baseline_ready: boolean;
   /** false = 无变更组记录，hash 部分跳过 */
   alter_ready: boolean;
+  /** 未入库文件过多未能逐项列出时的说明；null = 全部列出 */
+  hidden_note: string | null;
 }
 
 /** 变更组摘要（详情页配置抽屉） */

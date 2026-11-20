@@ -27,8 +27,16 @@ async function load() {
     const p = await api.getWritebackPlan(props.taskId);
     plan.value = p;
     const next: Record<string, boolean> = {};
-    // 默认全选（防漏档），required 强制选中
-    for (const f of p.files) next[keyOf(f.scope, f.rel_path)] = true;
+    for (const f of p.files) {
+      // 默认勾选：required（已入库且内容变更）必选；用户路径全量默认勾；
+      // 游戏本体里「未入库且自基线未变」的默认不勾（避免一确认就把整包塞进 SakuAlter）
+      const unalteredBg =
+        f.scope === "bg" &&
+        !f.required &&
+        f.reason.includes("new") &&
+        !f.reason.includes("mtime");
+      next[keyOf(f.scope, f.rel_path)] = !unalteredBg;
+    }
     checked.value = next;
   } catch (e) {
     emit("toast", errorText(e), true);
@@ -146,6 +154,7 @@ function reasonText(f: CandidateFile) {
   const parts: string[] = [];
   if (f.reason.includes("hash")) parts.push("内容变更");
   if (f.reason.includes("mtime")) parts.push("mtime 变动");
+  if (parts.length === 0 && f.reason.includes("new")) parts.push("未入库");
   return parts.join(" · ") || "变动";
 }
 
@@ -192,9 +201,9 @@ async function cancel() {
           </h3>
           <p class="wb-hint">
             <template v-if="hasFiles">
-              已有变更组文件（内容变更）默认回写；请勾选需要额外保留的变动文件。
+              标记「自动回写」的为已入库且内容变更，必须回写；其余请勾选需要存入 SakuAlter 的文件。
             </template>
-            <template v-else>没有检测到变动文件，确认后将直接移除缓存副本。</template>
+            <template v-else>没有检测到需要回写的文件，确认后将直接移除缓存副本。</template>
           </p>
         </div>
         <button class="wb-x" title="中止回写" @click="cancel">✕</button>
@@ -216,8 +225,9 @@ async function cancel() {
             建议先取消并重新搬运一次（搬运会建立基线）。用户路径若已配置，本次仍会列出其全部文件。
           </div>
           <div v-if="requiredCount > 0" class="wb-note">
-            已有变更组文件内容变更 {{ requiredCount }} 个，将自动回写且不可取消勾选
+            已入库且内容变更的文件 {{ requiredCount }} 个，将自动回写且不可取消勾选
           </div>
+          <div v-if="plan.hidden_note" class="wb-note">{{ plan.hidden_note }}</div>
 
           <!-- 游戏本体 -->
           <div class="wb-group">

@@ -626,6 +626,8 @@ pub struct WritebackCandidates {
     pub baseline_ready: bool,
     /// false = 无变更组记录，hash 部分跳过
     pub alter_ready: bool,
+    /// 未入库文件过多、未能逐项列出时的说明；None = 全部列出
+    pub hidden_note: Option<String>,
 }
 
 /// 变更组摘要（详情页展示）
