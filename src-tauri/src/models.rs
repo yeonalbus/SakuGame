@@ -455,6 +455,8 @@ pub enum TransferStatus {
     WaitingConfirm,
     Error,
     Done,
+    /// v2.1：任务被取消（保留历史行；例如待确认时程序退出）
+    Cancelled,
 }
 
 impl TransferStatus {
@@ -466,6 +468,7 @@ impl TransferStatus {
             TransferStatus::WaitingConfirm => "waiting_confirm",
             TransferStatus::Error => "error",
             TransferStatus::Done => "done",
+            TransferStatus::Cancelled => "cancelled",
         }
     }
 
@@ -477,6 +480,7 @@ impl TransferStatus {
             "waiting_confirm" => Some(TransferStatus::WaitingConfirm),
             "error" => Some(TransferStatus::Error),
             "done" => Some(TransferStatus::Done),
+            "cancelled" => Some(TransferStatus::Cancelled),
             _ => None,
         }
     }

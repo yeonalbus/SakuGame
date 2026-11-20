@@ -152,7 +152,8 @@ export type TransferStatus =
   | "paused"
   | "waiting_confirm"
   | "error"
-  | "done";
+  | "done"
+  | "cancelled";
 
 export type PreflightReason =
   | "pool_not_configured"
