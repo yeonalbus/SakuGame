@@ -80,6 +80,8 @@ export interface GameVersionRow {
   size_bytes: number;
   source: VersionSource;
   status: GameStatus;
+  /** v2.1：用户目录绝对路径；null = 未配置 */
+  user_path: string | null;
   executables: ExecutableRow[];
   updated_at: string;
 }
@@ -143,7 +145,14 @@ export interface AppErrorPayload {
 
 // ---- v2：缓存池 / 搬运 ----
 
-export type TransferStatus = "queued" | "running" | "paused" | "error" | "done";
+/** v2.1：waiting_confirm = 回写检测完成、等待勾选，不占并发额度 */
+export type TransferStatus =
+  | "queued"
+  | "running"
+  | "paused"
+  | "waiting_confirm"
+  | "error"
+  | "done";
 
 export type PreflightReason =
   | "pool_not_configured"
@@ -185,6 +194,12 @@ export interface TransferTaskView {
   repo_no: string;
   game_name: string;
   version_label: string;
+  /** pull = 仓库→池；writeback = 池→仓库 SakuAlter */
+  direction: "pull" | "writeback" | string;
+  /** v2.1 阶段键：transfer / inject / baseline / detect / waiting_confirm / extract / clean / store */
+  stage: string | null;
+  /** 该任务占用的并发额度 */
+  concurrency: number;
   total_bytes: number;
   written_bytes: number;
   total_files: number;
@@ -217,6 +232,57 @@ export interface RepositoryDeletePreview {
   cache_count: number;
   cache_bytes: number;
   active_task_count: number;
+}
+
+// ---- v2.1：变更组 / 锚点 / 回写 ----
+
+/** 变更组文件引用（勾选确认 / 回写选择） */
+export interface AlterRef {
+  /** bg = 游戏本体；ud = 用户路径 */
+  scope: "bg" | "ud" | string;
+  rel_path: string;
+}
+
+/** 勾选树叶子 */
+export interface CandidateFile {
+  scope: "bg" | "ud" | string;
+  /** bg：相对版本层根；ud：相对 user_path */
+  rel_path: string;
+  size_bytes: number;
+  mtime_ms: number;
+  /** hash / mtime（可同时命中） */
+  reason: string[];
+  /** true = 已有变更组文件 hash 失配，必须回写且不可取消勾选 */
+  required: boolean;
+}
+
+/** 移出缓存前的候选集合 */
+export interface WritebackCandidates {
+  version_id: number;
+  game_name: string;
+  version_label: string;
+  files: CandidateFile[];
+  /** 相对基线被删除的路径（仅展示） */
+  deleted: string[];
+  user_path: string | null;
+  user_path_state: "ok" | "unset" | "unreachable" | string;
+  /** false = 无基线（v2.1 之前的旧缓存），mtime 部分跳过 */
+  baseline_ready: boolean;
+  /** false = 无变更组记录，hash 部分跳过 */
+  alter_ready: boolean;
+}
+
+/** 变更组摘要（详情页配置抽屉） */
+export interface AlterSummary {
+  version_id: number;
+  bg_count: number;
+  ud_count: number;
+  bytes: number;
+  /** ok / missing / drift / none */
+  anchor_state: string;
+  baseline_ready: boolean;
+  user_path_state: string;
+  user_path: string | null;
 }
 
 export type ViewKey = "home" | "transfer" | "settings" | "detail";

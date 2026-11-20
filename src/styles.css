@@ -1364,3 +1364,407 @@ button.danger-solid:hover:not(:disabled) {
   color: var(--accent);
 }
 
+
+/* ==========================================================================
+   MVP v2.1：搬运页（并发池 / 方向徽章 / 微步骤流水线）
+   ========================================================================== */
+
+.tv-pool {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 16px;
+  margin-bottom: 12px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+.tv-pool b {
+  color: var(--accent);
+  font-size: 13px;
+}
+
+.tv-dir {
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 6px;
+  padding: 1px 8px;
+  white-space: nowrap;
+}
+
+.tv-dir.down {
+  color: #6ea8ff;
+  background: rgba(91, 140, 255, 0.14);
+}
+
+.tv-dir.up {
+  color: #c58bff;
+  background: rgba(180, 120, 255, 0.14);
+}
+
+.tv-conc {
+  font-size: 12px;
+  color: var(--text-dim);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1px 8px;
+  white-space: nowrap;
+}
+
+.tv-task.wc {
+  border-color: rgba(224, 169, 92, 0.55);
+  box-shadow: inset 3px 0 0 rgba(224, 169, 92, 0.75);
+}
+
+.tv-meta .warn { color: #e0a95c; }
+.tv-meta .err { color: var(--danger); }
+.tv-meta .ok { color: var(--ok); }
+.tv-meta .info { color: #6ea8ff; }
+
+.tv-steps {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  margin-top: 8px;
+  padding: 5px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  width: fit-content;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 11.5px;
+}
+
+.tv-step {
+  color: var(--text-faint);
+  padding: 1px 4px;
+}
+
+.tv-step.done { color: rgba(76, 175, 125, 0.92); }
+.tv-step.active { color: #fff; font-weight: 600; }
+
+.tv-step-arrow {
+  color: #4b5260;
+  margin: 0 4px;
+}
+
+/* ==========================================================================
+   MVP v2.1：变更组勾选弹窗
+   ========================================================================== */
+
+.wb-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.72);
+  padding: 24px;
+}
+
+.wb-dialog {
+  width: min(680px, 100%);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
+}
+
+.wb-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 15px 18px;
+  border-bottom: 1px solid var(--border);
+}
+
+.wb-head h3 {
+  margin: 0;
+  font-size: 15px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.wb-sub {
+  font-size: 12px;
+  font-family: Consolas, monospace;
+  color: #e0a95c;
+  background: rgba(224, 169, 92, 0.12);
+  border-radius: 6px;
+  padding: 1px 8px;
+}
+
+.wb-hint {
+  margin: 5px 0 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.wb-x {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-size: 15px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+
+.wb-x:hover {
+  color: #fff;
+  background: var(--bg-hover);
+}
+
+.wb-body {
+  padding: 14px 18px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.wb-empty {
+  color: var(--text-dim);
+  font-size: 13px;
+  padding: 18px 0;
+  text-align: center;
+}
+
+.wb-warn {
+  font-size: 12.5px;
+  color: #e0a95c;
+  background: rgba(224, 169, 92, 0.1);
+  border: 1px solid rgba(224, 169, 92, 0.35);
+  border-radius: 8px;
+  padding: 7px 11px;
+}
+
+.wb-note {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 11px;
+}
+
+.wb-group {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+.wb-scope {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.wb-scope .faint {
+  font-weight: 400;
+  margin-left: auto;
+  font-size: 12px;
+}
+
+.wb-empty-line {
+  font-size: 12.5px;
+  color: var(--text-faint);
+  padding: 6px 0 2px 24px;
+}
+
+.wb-dir {
+  margin: 8px 0 0 22px;
+  border-left: 1px solid var(--border);
+  padding-left: 10px;
+}
+
+.wb-dir-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  color: #d8b06a;
+  cursor: pointer;
+}
+
+.wb-dir-name {
+  background: transparent;
+  border: none;
+  color: inherit;
+  font-family: Consolas, monospace;
+  font-size: 12.5px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.wb-files {
+  margin: 4px 0 0 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.wb-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  padding: 2px 4px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.wb-file:hover {
+  background: var(--bg-hover);
+}
+
+.wb-file-name {
+  font-family: Consolas, monospace;
+  color: var(--text);
+}
+
+.wb-file-name.req {
+  color: #e0a95c;
+}
+
+.wb-file-meta {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+.wb-req {
+  color: var(--ok);
+}
+
+.wb-deleted {
+  font-size: 12px;
+  color: var(--text-faint);
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+
+.wb-deleted-title {
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+
+.wb-deleted-item {
+  font-family: Consolas, monospace;
+  font-size: 11.5px;
+  padding: 1px 0;
+}
+
+.wb-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border);
+  background: #171a20;
+  font-size: 12.5px;
+}
+
+.wb-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* ==========================================================================
+   MVP v2.1：详情页（形态胶囊 / 版本卡片 / 变更组摘要）
+   ========================================================================== */
+
+.layout-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  font-weight: 600;
+  border-radius: 999px;
+  padding: 1px 9px;
+  margin-right: 8px;
+}
+
+.layout-pill i {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: currentColor;
+}
+
+.layout-pill.standard {
+  color: #4caf7d;
+  background: rgba(76, 175, 125, 0.14);
+  border: 1px solid rgba(76, 175, 125, 0.32);
+}
+
+.layout-pill.compact {
+  color: #f08a3c;
+  background: rgba(240, 138, 60, 0.14);
+  border: 1px solid rgba(240, 138, 60, 0.32);
+}
+
+.version-item {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  margin-bottom: 10px;
+  overflow: hidden;
+}
+
+.version-item.busy {
+  border-color: rgba(91, 140, 255, 0.55);
+  animation: cardPulse 1.9s ease-in-out infinite;
+}
+
+@keyframes cardPulse {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(91, 140, 255, 0.15); }
+  50% { box-shadow: 0 0 0 3px rgba(91, 140, 255, 0.28); }
+}
+
+.alter-block {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+.alter-block .faint {
+  font-size: 12px;
+}
+
+.alter-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-top: 6px;
+}
+
+.alter-row input {
+  flex: 1;
+}

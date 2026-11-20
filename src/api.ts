@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AlterRef,
+  AlterSummary,
   BlocklistRow,
   CacheConfig,
   CacheUsage,
@@ -17,6 +19,7 @@ import type {
   TransferTaskView,
   UnblockOutcome,
   VersionState,
+  WritebackCandidates,
 } from "./types";
 
 export const api = {
@@ -102,6 +105,18 @@ export const api = {
   cancelTransfer: (taskId: number) => invoke<void>("cancel_transfer", { taskId }),
   retryTransfer: (taskId: number) => invoke<number>("retry_transfer", { taskId }),
   removeCache: (versionId: number) => invoke<void>("remove_cache", { versionId }),
+
+  // ---- 变更组 / 回写（v2.1）----
+  startWriteback: (versionId: number) => invoke<number>("start_writeback", { versionId }),
+  getWritebackPlan: (taskId: number) =>
+    invoke<WritebackCandidates>("get_writeback_plan", { taskId }),
+  confirmWriteback: (taskId: number, selection: AlterRef[]) =>
+    invoke<void>("confirm_writeback", { taskId, selection }),
+  abortWriteback: (taskId: number) => invoke<void>("abort_writeback", { taskId }),
+  setVersionUserPath: (versionId: number, path: string | null) =>
+    invoke<void>("set_version_user_path", { versionId, path }),
+  getAlterSummary: (versionId: number) =>
+    invoke<AlterSummary>("get_alter_summary", { versionId }),
 
   // ---- 启动 / 仓库（v2）----
   launchGame: (gameId: number) => invoke<void>("launch_game", { gameId }),
