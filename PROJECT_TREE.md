@@ -1,7 +1,7 @@
-﻿# SakuGame 项目结构（PROJECT_TREE）
+# SakuGame 项目结构（PROJECT_TREE）
 
 > 维护者：AI（`DSPlans/` 体系）。目录结构或文件职责发生变化时同步更新本文件（发布流程 §5）。
-> 最近更新：2026-11-20（v2.1：变更组 / 锚点 / 回写）
+> 最近更新：2026-11-21（v0.2.0 发版）
 
 ## 一、根目录
 
@@ -103,7 +103,7 @@ SakuGame/
 
 设置页添加仓库 → 可达性探测（`locator.rs`）→ 开始扫描（`scanner.rs` 两层枚举产出「游戏 + 版本」）→ 幂等落库（`store.rs` → SQLite：`games` / `game_versions` / `game_version_executables` / `game_version_files`，黑名单条目跳过）→ 事件 `scan://progress` / `scan://finished`（含告警明细）→ 主页卡片墙刷新（1 游戏 1 卡）；详情页的「档案重扫」走同一扫描槽，只刷新单个档案。
 
-设置页配置缓存池 → 详情页点「搬运」→ `preflight_transfer`（池配置 / 配额 / 安全线 / 压缩包 / 已缓存）→ `start_transfer` 递归求和 + 预留 + 入队 → 调度线程按 32 通道与文件数档位调入 → 工作线程池写入 `.staging/<task_id>/` → L1 校验 → 原子 rename 到 `池根/R{仓库id}/游戏标识层[/SakuVersion]` → 写 `cache_entries` → 事件 `transfer://progress`（200ms 节流）/ `transfer://state` → 详情页与搬运页同步；「启动」从池内路径拉起，全程不探测仓库；「从缓存池移除」删副本并归还容量。
+设置页配置缓存池 → 详情页点「搬运」→ `preflight_transfer`（池配置 / 配额 / 安全线 / 压缩包 / 已缓存）→ `start_transfer` 递归求和 + 预留 + 入队 → 调度线程按 32 通道与文件数档位调入 → 工作线程池写入 `.staging/<task_id>/` → L1 校验 → 原子 rename 到 `池根/R{槽位号}/游戏标识层[/版本标识层 | /SakuCompact]` → 写 `cache_entries` → 事件 `transfer://progress`（200ms 节流）/ `transfer://state` → 详情页与搬运页同步；「启动」从池内路径拉起，全程不探测仓库；「从缓存池移除」删副本并归还容量。
 
 ## 六、数据模型（v2.1）
 
